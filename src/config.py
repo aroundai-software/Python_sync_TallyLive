@@ -1,6 +1,12 @@
 import logging
 import os
 
+# Baked in so a packaged EXE runs on a client machine with no .env present.
+# An environment variable still wins if one is set.
+SUPABASE_URL = "https://gwerbqebixlmniqzlhuk.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3ZXJicWViaXhsbW5pcXpsaHVrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MTAwOTUsImV4cCI6MjEwMTQ4NjA5NX0.qq7Ddl-SxH6glpUypFDrD8Jf5sQ8uPd85QhfTGtqvOE"
+
+
 def load_config():
     from dotenv import load_dotenv
     load_dotenv(override=True)
@@ -12,21 +18,13 @@ def load_config():
     tally_port = str(os.environ.get("TALLY_PORT", 9000)).strip()
     tally_url = f"{tally_host}:{tally_port}" if tally_port else tally_host
 
-    supabase_url = (os.environ.get("SUPABASE_URL") or "").strip()
-    supabase_key = (os.environ.get("SUPABASE_KEY") or "").strip()
-    if not supabase_url or not supabase_key:
-        raise ValueError(
-            "SUPABASE_URL and SUPABASE_KEY must be set in the .env file. "
-            "See .env.example for the expected settings."
-        )
-
     return {
         "tally_host": os.environ.get("TALLY_HOST", "localhost"),
         "tally_port": tally_port,
         "tally_url": tally_url,
         "sync_interval": int(os.environ.get("SYNC_INTERVAL", 1800)),
-        "supabase_url": supabase_url,
-        "supabase_key": supabase_key
+        "supabase_url": (os.environ.get("SUPABASE_URL") or "").strip() or SUPABASE_URL,
+        "supabase_key": (os.environ.get("SUPABASE_KEY") or "").strip() or SUPABASE_KEY
     }
 
 

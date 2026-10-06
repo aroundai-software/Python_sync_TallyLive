@@ -10,6 +10,7 @@ from supabase import create_client
 
 from .config import load_config
 from .tally_companies import get_company_details
+from .source_values import clean_source_xml, decode_response, source_number
 
 
 # =====================================================
@@ -61,25 +62,7 @@ def get_text_or_none(value):
 
 def safe_float(value, default=0.0):
 
-    try:
-
-        value = get_text(value)
-
-        value = value.replace(",", "")
-
-        match = re.search(
-            r"-?\d+(\.\d+)?",
-            value
-        )
-
-        if not match:
-            return default
-
-        return float(match.group())
-
-    except Exception:
-
-        return default
+    return source_number(value, default)
 
 
 def format_tally_date(value):
@@ -140,7 +123,7 @@ def resolve_due_date_and_credit_days(bill, invoice_date):
     if not invoice_date:
         return None, 0, 0
     inv_date_obj = datetime.fromisoformat(invoice_date).date()
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now().date()
 
     # 1. Direct Due Date from Tally
     raw_due = get_text(bill.get("BILLDUEDATE")) or get_text(bill.get("DUEDATE"))
@@ -177,6 +160,14 @@ def resolve_due_date_and_credit_days(bill, invoice_date):
     # 3. String credit period (e.g. '19 Days', '30 days', '1 Month')
     credit_str = get_text(credit_period)
     if credit_str:
+        # Absolute native dates must be parsed before duration digits.
+        for fmt in ('%d-%b-%y', '%d-%b-%Y', '%d/%m/%Y', '%d/%m/%y', '%Y-%m-%d', '%Y%m%d'):
+            try:
+                due_dt = datetime.strptime(credit_str.strip(), fmt).date()
+                return due_dt.isoformat(), max(0, (due_dt - inv_date_obj).days), max(0, (today - due_dt).days)
+            except ValueError:
+                pass
+
         month_match = re.search(r'(\d+)\s*(?:month|m)\b', credit_str, re.IGNORECASE)
         if month_match:
             days = int(month_match.group(1)) * 30
@@ -184,7 +175,7 @@ def resolve_due_date_and_credit_days(bill, invoice_date):
             overdue_days = max(0, (today - due_dt).days) if today > due_dt else 0
             return due_dt.isoformat(), days, overdue_days
 
-        day_match = re.search(r'(\d+)', credit_str)
+        day_match = re.fullmatch(r'(\d+)\s*(?:Days?)?', credit_str, re.IGNORECASE)
         if day_match:
             days = int(day_match.group(1))
             due_dt = inv_date_obj + timedelta(days=days)
@@ -206,27 +197,9 @@ def resolve_due_date_and_credit_days(bill, invoice_date):
 
 
 def clean_tally_xml(xml_text):
-    """Remove invalid XML character refs and fix stray ampersands."""
+    """Strip only illegal control characters; keep legal entities intact."""
 
-    if not xml_text:
-        return ""
-
-    xml_text = xml_text.replace('encoding="utf-16"', 'encoding="utf-8"')
-    xml_text = xml_text.replace('\x00', '')
-
-    xml_text = re.sub(
-        r'&#(?:x[0-9A-Fa-f]+|\d+);',
-        '',
-        xml_text
-    )
-
-    xml_text = re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;)",
-        "&amp;",
-        xml_text
-    )
-
-    return xml_text
+    return clean_source_xml(xml_text)
 
 
 # =====================================================
@@ -374,7 +347,7 @@ def get_outstanding_payables(company_name: str = None):
     # CLEAN & PARSE XML
     # -------------------------------------------------
 
-    xml_content = clean_tally_xml(response.text)
+    xml_content = clean_tally_xml(decode_response(response))
 
     data = xmltodict.parse(xml_content)
 
@@ -421,7 +394,7 @@ def get_outstanding_payables(company_name: str = None):
 
     except Exception as e:
 
-        print(f"Customer lookup error: {e}")
+        logging.error(f"Customer lookup failed; payables will carry no master_id/mobile: {e}")
 
     # -------------------------------------------------
     # PROCESS BILLS
@@ -429,6 +402,7 @@ def get_outstanding_payables(company_name: str = None):
 
     now = datetime.now(timezone.utc).isoformat()
     outstandings_list = []
+    failed_bills = 0
 
     for bill in bills:
 
@@ -567,7 +541,14 @@ def get_outstanding_payables(company_name: str = None):
 
         except Exception as e:
 
-            print(f"Bill Error: {e}")
+            failed_bills += 1
+            logging.error(f"Bill Error ({get_text(bill.get('NAME')) or '<no name>'}): {e}")
+
+    if failed_bills:
+        logging.error(
+            f"Outstanding payables incomplete: {failed_bills} of {len(bills)} bills "
+            f"could not be parsed and were skipped."
+        )
 
     # Deduplicate GUIDs to prevent any batch upsert collision within the company
     seen_guids = set()
@@ -596,6 +577,7 @@ def save_outstanding_payables_to_supabase(outstandings, company_name=None):
         staged = save_to_local_db("outstanding_payables", outstandings, company_name or "")
         logging.info(f"[LocalDB] Staged {staged} outstanding payables locally in sync_cache.db")
         return staged
+    logging.info("No outstanding payables to save.")
     return 0
 
 

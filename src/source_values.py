@@ -100,8 +100,12 @@ def paged_rows(client,table,columns,company):
 def reconcile_from_id(value):
     return 0 if os.environ.get('FULL_RECONCILE','').lower() in ('1','true','yes') else value
 
+# Used only when Tally's export omits the base currency. Tally's own value
+# always wins, so this is not the blanket override the old AED constant was.
+DEFAULT_BASE_CURRENCY='INR'
+
 def company_currency(company):
-    raw=text(company.get('BASECURRENCYNAME') or company.get('CURRENCYNAME') or os.environ.get('TALLY_BASE_CURRENCY'))
+    raw=text(company.get('BASECURRENCYNAME') or company.get('CURRENCYNAME') or os.environ.get('TALLY_BASE_CURRENCY') or DEFAULT_BASE_CURRENCY)
     mapping={'₹':'INR','Rs':'INR','Rs.':'INR','INR':'INR','AED':'AED','Dhs':'AED','USD':'USD','$':'USD','EUR':'EUR','€':'EUR','GBP':'GBP','£':'GBP'}
     if raw not in mapping:raise ValueError('Native company base currency is unavailable or unsupported')
     return mapping[raw]

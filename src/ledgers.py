@@ -9,6 +9,13 @@ from xml.sax.saxutils import escape
 from supabase import create_client
 
 from .config import load_config
+from .source_values import (
+    clean_source_xml,
+    decode_response,
+    effective_xml,
+    reconcile_from_id,
+    source_number,
+)
 from .tally_companies import get_company_details
 
 
@@ -29,20 +36,8 @@ def safe_text(parent, tag):
 
 
 def clean_tally_xml(xml_text):
-
-    xml_text = re.sub(
-        r'&#(?:x[0-9A-Fa-f]+|\d+);',
-        '',
-        xml_text
-    )
-
-    xml_text = re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;)",
-        "&amp;",
-        xml_text
-    )
-
-    return xml_text
+    """Strip only illegal control characters, keeping legal character references."""
+    return clean_source_xml(xml_text)
 
 
 def parse_opening_balance(raw):
@@ -66,24 +61,12 @@ def parse_opening_balance(raw):
         ob_type = "CR"
         raw = raw[:-2].strip()
 
-    try:
-        return float(raw), ob_type
-    except ValueError:
-        return 0.0, ob_type
+    return source_number(raw), ob_type
 
 
 def parse_amount(raw):
-    """Parse a plain numeric amount from Tally (no Dr/Cr suffix)."""
-
-    if not raw:
-        return None
-
-    raw = raw.strip()
-
-    try:
-        return float(raw)
-    except ValueError:
-        return None
+    """Parse a numeric amount from Tally, honouring its native currency notation."""
+    return source_number(raw, None)
 
 
 def parse_signed_balance(raw):
@@ -93,26 +76,7 @@ def parse_signed_balance(raw):
       - Negative value '-732117.00' or 'Dr' suffix = DEBIT (+732117.00 in DB)
       - Positive value '732117.00' or 'Cr' suffix = CREDIT (-732117.00 in DB)
     """
-    if not raw:
-        return 0.0
-
-    raw = str(raw).strip()
-
-    if raw.lower().endswith("dr"):
-        return abs(parse_amount(raw[:-2]) or 0.0)
-    elif raw.lower().endswith("cr"):
-        return -abs(parse_amount(raw[:-2]) or 0.0)
-
-    val = parse_amount(raw)
-    if val is None:
-        return 0.0
-
-    if raw.startswith("-"):
-        return abs(val)
-    elif val > 0:
-        return -abs(val)
-    
-    return 0.0
+    return -source_number(raw)
 
 
 # =====================================================
@@ -173,7 +137,8 @@ def extract_ledger_data(ledger, company_name):
     address_line1 = address_line2 = address_line3 = None
     city = emirate = country = pin_code = None
 
-    mailing = ledger.find("LEDMAILINGDETAILS.LIST")
+    # Tally returns a dated history of mailing details; use today's applicable entry.
+    mailing = effective_xml(ledger, "LEDMAILINGDETAILS.LIST")
     if mailing is None:
         mailing = ledger
 
@@ -243,7 +208,7 @@ def extract_ledger_data(ledger, company_name):
 
     # --- GST / TRN ---
     trn_number = None
-    gst_details = ledger.find("LEDGSTREGDETAILS.LIST")
+    gst_details = effective_xml(ledger, "LEDGSTREGDETAILS.LIST")
 
     if gst_details is not None:
         trn_number = safe_text(gst_details, "GSTIN")
@@ -389,7 +354,8 @@ def get_ledgers(company_name: str = None):
         company_details = get_company_details()
         company_name = company_details.get("company_name", "")
 
-    max_alter_id = get_max_alter_id("customers", company_name)
+    # FULL_RECONCILE=1 forces the watermark back to 0 for a complete re-read.
+    max_alter_id = reconcile_from_id(get_max_alter_id("customers", company_name))
     filter_tag = "<FILTER>AlterIdFilter</FILTER>" if max_alter_id > 0 else ""
     formula_tag = f'<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterId &gt; {max_alter_id}</SYSTEM>' if max_alter_id > 0 else ""
 
@@ -411,7 +377,7 @@ def get_ledgers(company_name: str = None):
                 <TDLMESSAGE>
                     <COLLECTION NAME="Ledger Collection">
                         <TYPE>Ledger</TYPE>
-                        <FETCH>NAME, PARENT, OPENINGBALANCE, CLOSINGBALANCE, MAILINGNAME.LIST, ADDRESS.LIST, STATE, COUNTRY, PINCODE, CITY, PLACEOFSUPPLY, MOBILE, MOBILENO, LEDGERMOBILE, PARTYMOBILENO, PHONENUMBER, LEDGERPHONE, PARTYPHONENO, EMAIL, PARTYEMAIL, CONTACTPERSON, CONTACT, LEDGSTREGDETAILS.LIST, CREDITLIMIT, CREDITPERIOD, LEDGERCODE, ALTERID, MASTERID, GUID</FETCH>
+                        <FETCH>NAME, PARENT, OPENINGBALANCE, CLOSINGBALANCE, MAILINGNAME.LIST, ADDRESS.LIST, STATE, COUNTRY, PINCODE, CITY, PLACEOFSUPPLY, MOBILE, MOBILENO, LEDGERMOBILE, PARTYMOBILENO, PHONENUMBER, LEDGERPHONE, PARTYPHONENO, EMAIL, PARTYEMAIL, CONTACTPERSON, CONTACT, LEDGSTREGDETAILS.LIST, LEDMAILINGDETAILS.LIST, LANGUAGENAME.LIST, PANNUMBER, CREDITLIMIT, CREDITPERIOD, LEDGERCODE, ALTERID, MASTERID, GUID</FETCH>
                         {filter_tag}
                     </COLLECTION>
                     {formula_tag}
@@ -432,16 +398,26 @@ def get_ledgers(company_name: str = None):
     )
     response.raise_for_status()
 
-    response_text = clean_tally_xml(response.text)
+    response_text = clean_tally_xml(decode_response(response))
     root = ET.fromstring(response_text)
 
     ledgers = []
+    skipped = 0
     for ledger in root.findall(".//COLLECTION/LEDGER"):
         name = ledger.attrib.get("NAME", "").strip()
         if not name:
             continue
-        data = extract_ledger_data(ledger, company_name)
+        try:
+            data = extract_ledger_data(ledger, company_name)
+        except Exception as e:
+            # Skip the unreadable ledger but keep the rest of the fetch going.
+            skipped += 1
+            logging.error(f"Error parsing ledger '{name}': {e}")
+            continue
         ledgers.append(data)
+
+    if skipped:
+        logging.error(f"Skipped {skipped} unreadable ledger(s) for {company_name}")
 
     return ledgers
 
@@ -472,7 +448,8 @@ def save_ledgers_to_supabase(ledgers):
             ).execute()
             return len(batch)
         except Exception as e:
-            logging.info(f"Batch upload failed: {e}")
+            # Report the loss rather than counting the batch as saved.
+            logging.error(f"Ledger batch upload failed ({len(batch)} rows lost): {e}")
             return 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -562,7 +539,8 @@ def extract_customer_data(ledger, company_name):
     address_lines = []
     city = state = country = pincode = None
 
-    mailing = ledger.find("LEDMAILINGDETAILS.LIST")
+    # Tally returns a dated history of mailing details; use today's applicable entry.
+    mailing = effective_xml(ledger, "LEDMAILINGDETAILS.LIST")
     if mailing is None:
         mailing = ledger
 
@@ -601,7 +579,11 @@ def extract_customer_data(ledger, company_name):
 
     address = "\n".join(address_lines) if address_lines else None
 
-    mailing_name = safe_text(ledger, "MAILINGNAME") or customer_name
+    mailing_name = (
+        safe_text(mailing, "MAILINGNAME")
+        or safe_text(ledger, "MAILINGNAME")
+        or customer_name
+    )
 
     # --- Contact details ---
     mobile_number = (
@@ -623,7 +605,7 @@ def extract_customer_data(ledger, company_name):
 
     # --- GST / PAN ---
     gst_number = None
-    gst_details = ledger.find("LEDGSTREGDETAILS.LIST")
+    gst_details = effective_xml(ledger, "LEDGSTREGDETAILS.LIST")
 
     if gst_details is not None:
         gst_number = safe_text(gst_details, "GSTIN")
@@ -733,7 +715,8 @@ def extract_customer_data(ledger, company_name):
 
 
 def _fetch_customer_group(group_name, config, company_name, use_alter_id=True):
-    max_alter_id = get_max_alter_id("customers", company_name) if use_alter_id else 0
+    # FULL_RECONCILE=1 forces the watermark back to 0 for a complete re-read.
+    max_alter_id = reconcile_from_id(get_max_alter_id("customers", company_name)) if use_alter_id else 0
     filter_tag = "<FILTER>AlterIdFilter</FILTER>" if (use_alter_id and max_alter_id > 0) else ""
     formula_tag = f'<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterId &gt; {max_alter_id}</SYSTEM>' if (use_alter_id and max_alter_id > 0) else ""
     
@@ -765,7 +748,7 @@ def _fetch_customer_group(group_name, config, company_name, use_alter_id=True):
                     <COLLECTION NAME="Ledger Collection">
                         <TYPE>Ledger</TYPE>
                         {child_tags}
-                        <FETCH>NAME, PARENT, OPENINGBALANCE, CLOSINGBALANCE, MAILINGNAME.LIST, ADDRESS.LIST, STATE, COUNTRY, PINCODE, CITY, PLACEOFSUPPLY, MOBILE, MOBILENO, LEDGERMOBILE, PARTYMOBILENO, PHONENUMBER, LEDGERPHONE, PARTYPHONENO, EMAIL, PARTYEMAIL, CONTACTPERSON, CONTACT, LEDGSTREGDETAILS.LIST, CREDITLIMIT, CREDITPERIOD, LEDGERCODE, ALTERID, MASTERID, GUID</FETCH>
+                        <FETCH>NAME, PARENT, OPENINGBALANCE, CLOSINGBALANCE, MAILINGNAME.LIST, ADDRESS.LIST, STATE, COUNTRY, PINCODE, CITY, PLACEOFSUPPLY, MOBILE, MOBILENO, LEDGERMOBILE, PARTYMOBILENO, PHONENUMBER, LEDGERPHONE, PARTYPHONENO, EMAIL, PARTYEMAIL, CONTACTPERSON, CONTACT, LEDGSTREGDETAILS.LIST, LEDMAILINGDETAILS.LIST, LANGUAGENAME.LIST, PANNUMBER, DISCOUNTPERCENTAGE, CREDITLIMIT, CREDITPERIOD, LEDGERCODE, ALTERID, MASTERID, GUID</FETCH>
                         {filter_tag}
                     </COLLECTION>
                     {formula_tag}
@@ -784,17 +767,30 @@ def _fetch_customer_group(group_name, config, company_name, use_alter_id=True):
     )
     response.raise_for_status()
 
-    response_text = clean_tally_xml(response.text)
+    response_text = clean_tally_xml(decode_response(response))
     root = ET.fromstring(response_text)
-    
+
     group_customers = []
+    skipped = 0
     for ledger in root.findall(".//COLLECTION/LEDGER"):
         name = ledger.attrib.get("NAME", "").strip()
         if not name:
             continue
-        data = extract_customer_data(ledger, company_name)
+        try:
+            data = extract_customer_data(ledger, company_name)
+        except Exception as e:
+            # Skip the unreadable ledger but keep the rest of the group going.
+            skipped += 1
+            logging.error(f"Error parsing ledger '{name}': {e}")
+            continue
         group_customers.append(data)
-        
+
+    if skipped:
+        logging.error(
+            f"Skipped {skipped} unreadable ledger(s) in group "
+            f"'{group_name or 'All'}' for {company_name}"
+        )
+
     return group_customers
 
 def sync_cash_bank_balances(company_name: str, config=None) -> int:
@@ -852,7 +848,7 @@ def sync_cash_bank_balances(company_name: str, config=None) -> int:
             logging.info(f"[LocalDB] Refreshed {updated} cash/bank balances for {company_name}")
         return updated
     except Exception as e:
-        logging.warning(f"Cash/bank balance refresh failed: {e}")
+        logging.error(f"Cash/bank balance refresh failed for {company_name}: {e}")
         return 0
 
 
@@ -904,11 +900,12 @@ def sync_customer_balances(company_name: str, config=None, supabase=None):
             timeout=180
         )
         response.raise_for_status()
-        response_text = clean_tally_xml(response.text)
+        response_text = clean_tally_xml(decode_response(response))
         root = ET.fromstring(response_text)
 
         conn = get_connection()
         updated_count = 0
+        unreadable = 0
         try:
             with conn:
                 for ledger in root.findall(".//COLLECTION/LEDGER"):
@@ -917,7 +914,16 @@ def sync_customer_balances(company_name: str, config=None, supabase=None):
                         continue
 
                     cb_raw = safe_text(ledger, "CLOSINGBALANCE")
-                    closing_balance = round(parse_signed_balance(cb_raw), 2)
+                    try:
+                        closing_balance = round(parse_signed_balance(cb_raw), 2)
+                    except Exception as e:
+                        # One unreadable balance must not abandon every other ledger.
+                        unreadable += 1
+                        logging.error(
+                            f"Error reading closing balance for ledger "
+                            f"'{ledger.attrib.get('NAME', guid)}': {e}"
+                        )
+                        continue
 
                     cur = conn.execute(
                         'UPDATE "customers" SET closing_balance = ?, _sync_status = "pending", _synced_at = NULL '
@@ -930,10 +936,14 @@ def sync_customer_balances(company_name: str, config=None, supabase=None):
 
         if updated_count > 0:
             logging.info(f"[LocalDB] Updated balances for {updated_count} ledger(s) locally ({company_name}).")
+        if unreadable:
+            logging.error(
+                f"[LocalDB] {unreadable} ledger balance(s) were unreadable for {company_name}"
+            )
         return updated_count
 
     except Exception as e:
-        logging.warning(f"Customer balance feed failed: {e}")
+        logging.error(f"Customer balance feed failed for {company_name}: {e}")
         return 0
 
 def get_customers(company_name: str = None):
@@ -997,7 +1007,7 @@ def save_customers_to_supabase(customers, company_name: str = None):
     try:
         sync_cash_bank_balances(comp_name)
     except Exception as e:
-        logging.warning(f"Post-save cash/bank balance refresh skipped: {e}")
+        logging.error(f"Post-save cash/bank balance refresh failed for {comp_name}: {e}")
     return staged
 
 
@@ -1042,7 +1052,7 @@ def reconcile_deleted_customers(company_name: str) -> int:
             timeout=120
         )
         response.raise_for_status()
-        clean_xml = clean_tally_xml(response.text)
+        clean_xml = clean_tally_xml(decode_response(response))
         root = ET.fromstring(clean_xml)
 
         tally_active_guids = set()
@@ -1054,7 +1064,11 @@ def reconcile_deleted_customers(company_name: str) -> int:
                 tally_active_guids.add(g.strip())
 
     except Exception as e:
-        logging.warning(f"Could not fetch active Ledger GUIDs from Tally for reconciliation: {e}")
+        # Returning 0 is the safe outcome, but it is a failure and not "nothing deleted".
+        logging.error(
+            f"Could not fetch active Ledger GUIDs from Tally for {company_name}; "
+            f"deletion reconciliation skipped this cycle: {e}"
+        )
         return 0
 
     from .local_db import reconcile_local_deletions

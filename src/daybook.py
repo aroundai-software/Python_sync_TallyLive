@@ -9,6 +9,13 @@ from xml.sax.saxutils import escape
 
 from supabase import create_client
 
+from .source_values import (
+    clean_source_xml,
+    decode_response,
+    reconcile_from_id,
+    source_number,
+)
+
 from .config import load_config
 from .tally_companies import get_company_details
 from .date_utils import get_current_fy_item_date_ranges, get_current_fy_monthly_date_ranges
@@ -41,15 +48,7 @@ def get_text_or_none(value):
     return text if text else None
 
 def safe_float(value, default=0):
-    try:
-        value = get_text(value)
-        value = value.replace(",", "")
-        match = re.search(r"-?\d+(\.\d+)?", value)
-        if not match:
-            return default
-        return float(match.group())
-    except Exception:
-        return default
+    return source_number(value, default)
 
 def format_tally_date(value):
     value = get_text(value)
@@ -61,9 +60,7 @@ def format_tally_date(value):
         return None
 
 def clean_tally_xml(xml_text):
-    xml_text = re.sub(r'&#(?:x[0-9A-Fa-f]+|\d+);', '', xml_text)
-    xml_text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_text)
-    return xml_text
+    return clean_source_xml(xml_text)
 
 def get_max_alter_id(table_name: str, company_name: str) -> int:
     try:
@@ -97,17 +94,11 @@ def get_ledger_entries(voucher):
 
 def signed_entry_amount(entry):
     """
-    Tally credits are positive / ISDEEMEDPOSITIVE=No.
-    Debits are negative / ISDEEMEDPOSITIVE=Yes.
-    Prefer ISDEEMEDPOSITIVE so a missing minus sign still classifies correctly.
+    The native signed AMOUNT already carries the accounting direction
+    (debits negative, credits positive). ISDEEMEDPOSITIVE is a display
+    hint and must not override the real sign.
     """
-    raw = safe_float(entry.get("AMOUNT"))
-    deemed = get_text(entry.get("ISDEEMEDPOSITIVE")).lower()
-    if deemed == "yes":
-        return -abs(raw)
-    if deemed == "no":
-        return abs(raw)
-    return raw
+    return source_number(entry.get("AMOUNT"))
 
 
 def party_net_amount(entries, ledger_name):
@@ -146,13 +137,15 @@ def get_daybook(company_name: str = None):
     daybook_list = []
     
     from .local_db import get_max_alter_id_local
-    max_alter_id = get_max_alter_id_local("tally_daybook", company_name)
+    max_alter_id = reconcile_from_id(get_max_alter_id_local("tally_daybook", company_name))
     logging.info(f"Daybook incremental sync from alter_id > {max_alter_id}")
     
+    failed_chunks = []
     total_chunks = len(date_ranges)
     for chunk_idx, (start_date, end_date) in enumerate(date_ranges, 1):
         logging.info(f"[{chunk_idx}/{total_chunks}] Fetching Daybook {start_date} to {end_date}...")
         chunk_entries = []
+        failed_vouchers = []
         
         alter_filter_tag = "<FILTER>AlterIdFilter</FILTER>" if max_alter_id > 0 else ""
         alter_formula_tag = f'<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterId &gt; {max_alter_id}</SYSTEM>' if max_alter_id > 0 else ""
@@ -189,6 +182,7 @@ def get_daybook(company_name: str = None):
                             NARRATION,
                             ISDELETED,
                             ISCANCELLED,
+                            ISOPTIONAL,
                             ALLLEDGERENTRIES.LIST,
                             LEDGERENTRIES.LIST,
                             ALTERID
@@ -212,7 +206,7 @@ def get_daybook(company_name: str = None):
             )
             response.raise_for_status()
             
-            xml_content = clean_tally_xml(response.text)
+            xml_content = clean_tally_xml(decode_response(response))
             data = xmltodict.parse(xml_content)
             
             envelope = data.get("ENVELOPE") or {} if isinstance(data, dict) else {}
@@ -235,117 +229,130 @@ def get_daybook(company_name: str = None):
                         cancelled_guids.append(v_guid)
                     continue
 
-                guid = get_text(voucher.get("GUID"))
-                master_id = int(safe_float(voucher.get("MASTERID")))
-                date = format_tally_date(voucher.get("DATE"))
-                
-                if not date:
+                # Optional vouchers are memoranda, not real transactions.
+                if get_text(voucher.get("ISOPTIONAL")) == "Yes":
                     continue
 
-                voucher_number = get_text(voucher.get("VOUCHERNUMBER"))
-                voucher_type = get_text(voucher.get("VOUCHERTYPENAME"))
-                
-                party_ledger_name = get_text(voucher.get("PARTYLEDGERNAME"))
-                party_name = get_text(voucher.get("PARTYNAME"))
-                primary_ledger_name = party_ledger_name if party_ledger_name else party_name
-                
-                narration = get_text_or_none(voucher.get("NARRATION"))
+                try:
+                    guid = get_text(voucher.get("GUID"))
+                    master_id = int(safe_float(voucher.get("MASTERID")))
+                    date = format_tally_date(voucher.get("DATE"))
 
-                ledger_entries = get_ledger_entries(voucher)
+                    if not date:
+                        continue
 
-                if not ledger_entries:
-                    raw_amount = safe_float(voucher.get("AMOUNT"))
-                    row = {
-                        "date": date,
-                        "voucher_number": voucher_number if voucher_number else None,
-                        "voucher_type": voucher_type,
-                        "ledger_name": primary_ledger_name if primary_ledger_name else None,
-                        "particulars": None,
-                        "amount": abs(raw_amount),
-                        "is_debit": raw_amount < 0,
-                        "narration": narration,
-                        "company_name": company_name,
-                        "guid": guid,
-                        "master_id": str(master_id) if master_id else None,
-                        "alter_id": int(safe_float(voucher.get("ALTERID"), 0)),
-                        "updated_at": now,
-                    }
-                    daybook_list.append(row)
-                else:
-                    # Group entries by ledger name
-                    grouped_ledgers = {}
-                    for entry in ledger_entries:
-                        lname = get_text(entry.get("LEDGERNAME"))
-                        if not lname:
-                            continue
-                        if lname not in grouped_ledgers:
-                            grouped_ledgers[lname] = []
-                        grouped_ledgers[lname].append(entry)
+                    voucher_number = get_text(voucher.get("VOUCHERNUMBER"))
+                    voucher_type = get_text(voucher.get("VOUCHERTYPENAME"))
 
-                    # Determine primary ledger name
-                    if not primary_ledger_name or primary_ledger_name not in grouped_ledgers:
-                        primary_ledger_name = next(iter(grouped_ledgers.keys()), None)
+                    party_ledger_name = get_text(voucher.get("PARTYLEDGERNAME"))
+                    party_name = get_text(voucher.get("PARTYNAME"))
+                    primary_ledger_name = party_ledger_name if party_ledger_name else party_name
 
-                    # Compute signed net amount for each ledger
-                    ledger_summaries = {}
-                    for lname, entries in grouped_ledgers.items():
-                        net_signed = sum(signed_entry_amount(e) for e in entries)
-                        if abs(net_signed) < 0.001:
-                            continue
-                        ledger_summaries[lname] = {
-                            "amount": abs(net_signed),
-                            "is_debit": net_signed < 0,
-                        }
+                    narration = get_text_or_none(voucher.get("NARRATION"))
 
-                    # If ledger_summaries is empty (rare), fall back to raw amount
-                    if not ledger_summaries:
+                    ledger_entries = get_ledger_entries(voucher)
+
+                    if not ledger_entries:
                         raw_amount = safe_float(voucher.get("AMOUNT"))
-                        ledger_summaries[primary_ledger_name or "Unknown"] = {
-                            "amount": abs(raw_amount),
-                            "is_debit": raw_amount < 0,
-                        }
-
-                    for lname, info in ledger_summaries.items():
-                        # Find opposing ledgers (different debit/credit side)
-                        opposing = [
-                            other_name for other_name, other_info in ledger_summaries.items()
-                            if other_info["is_debit"] != info["is_debit"]
-                        ]
-                        if len(opposing) == 1:
-                            particulars = opposing[0]
-                        elif len(opposing) > 1:
-                            if primary_ledger_name in opposing and primary_ledger_name != lname:
-                                particulars = primary_ledger_name
-                            else:
-                                particulars = "As per details"
-                        else:
-                            particulars = None
-
-                        # Primary entry uses base voucher guid; sub-entries use slugged sub-guid
-                        if lname == primary_ledger_name:
-                            entry_guid = guid
-                        else:
-                            clean_lname = re.sub(r'[^a-zA-Z0-9]', '_', lname)
-                            entry_guid = f"{guid}#sub#{clean_lname}"
-
                         row = {
                             "date": date,
                             "voucher_number": voucher_number if voucher_number else None,
                             "voucher_type": voucher_type,
-                            "ledger_name": lname,
-                            "particulars": particulars,
-                            "amount": info["amount"],
-                            "is_debit": info["is_debit"],
+                            "ledger_name": primary_ledger_name if primary_ledger_name else None,
+                            "particulars": None,
+                            "amount": abs(raw_amount),
+                            "is_debit": raw_amount < 0,
                             "narration": narration,
                             "company_name": company_name,
-                            "guid": entry_guid,
+                            "guid": guid,
                             "master_id": str(master_id) if master_id else None,
                             "alter_id": int(safe_float(voucher.get("ALTERID"), 0)),
                             "updated_at": now,
                         }
                         daybook_list.append(row)
                         chunk_entries.append(row)
-                
+                    else:
+                        # Group entries by ledger name
+                        grouped_ledgers = {}
+                        for entry in ledger_entries:
+                            lname = get_text(entry.get("LEDGERNAME"))
+                            if not lname:
+                                continue
+                            if lname not in grouped_ledgers:
+                                grouped_ledgers[lname] = []
+                            grouped_ledgers[lname].append(entry)
+
+                        # Determine primary ledger name
+                        if not primary_ledger_name or primary_ledger_name not in grouped_ledgers:
+                            primary_ledger_name = next(iter(grouped_ledgers.keys()), None)
+
+                        # Compute signed net amount for each ledger
+                        ledger_summaries = {}
+                        for lname, entries in grouped_ledgers.items():
+                            net_signed = sum(signed_entry_amount(e) for e in entries)
+                            if abs(net_signed) < 0.001:
+                                continue
+                            ledger_summaries[lname] = {
+                                "amount": abs(net_signed),
+                                "is_debit": net_signed < 0,
+                            }
+
+                        # If ledger_summaries is empty (rare), fall back to raw amount
+                        if not ledger_summaries:
+                            raw_amount = safe_float(voucher.get("AMOUNT"))
+                            ledger_summaries[primary_ledger_name or "Unknown"] = {
+                                "amount": abs(raw_amount),
+                                "is_debit": raw_amount < 0,
+                            }
+
+                        for lname, info in ledger_summaries.items():
+                            # Find opposing ledgers (different debit/credit side)
+                            opposing = [
+                                other_name for other_name, other_info in ledger_summaries.items()
+                                if other_info["is_debit"] != info["is_debit"]
+                            ]
+                            if len(opposing) == 1:
+                                particulars = opposing[0]
+                            elif len(opposing) > 1:
+                                if primary_ledger_name in opposing and primary_ledger_name != lname:
+                                    particulars = primary_ledger_name
+                                else:
+                                    particulars = "As per details"
+                            else:
+                                particulars = None
+
+                            # Primary entry uses base voucher guid; sub-entries use slugged sub-guid
+                            if lname == primary_ledger_name:
+                                entry_guid = guid
+                            else:
+                                clean_lname = re.sub(r'[^a-zA-Z0-9]', '_', lname)
+                                entry_guid = f"{guid}#sub#{clean_lname}"
+
+                            row = {
+                                "date": date,
+                                "voucher_number": voucher_number if voucher_number else None,
+                                "voucher_type": voucher_type,
+                                "ledger_name": lname,
+                                "particulars": particulars,
+                                "amount": info["amount"],
+                                "is_debit": info["is_debit"],
+                                "narration": narration,
+                                "company_name": company_name,
+                                "guid": entry_guid,
+                                "master_id": str(master_id) if master_id else None,
+                                "alter_id": int(safe_float(voucher.get("ALTERID"), 0)),
+                                "updated_at": now,
+                            }
+                            daybook_list.append(row)
+                            chunk_entries.append(row)
+
+                except Exception as e:
+                    failed_vouchers.append(get_text(voucher.get("GUID")) or "<no guid>")
+                    logging.error(
+                        f"Voucher Error Daybook {get_text(voucher.get('VOUCHERNUMBER')) or '<no number>'} "
+                        f"({start_date}-{end_date}): {e}"
+                    )
+
             if cancelled_guids:
                 from .local_db import stage_deletions
                 stage_deletions("tally_daybook", cancelled_guids, company_name)
@@ -357,11 +364,24 @@ def get_daybook(company_name: str = None):
             else:
                 logging.info(f"[{chunk_idx}/{total_chunks}] 0 new daybook entries in ({start_date}-{end_date})")
 
+            if failed_vouchers:
+                logging.error(
+                    f"[{chunk_idx}/{total_chunks}] Skipped {len(failed_vouchers)} unparseable daybook "
+                    f"vouchers in ({start_date}-{end_date})"
+                )
+
         except Exception as e:
-            logging.info(f"Chunk Error Daybook ({start_date}-{end_date}): {e}")
+            failed_chunks.append(f"{start_date}-{end_date}")
+            logging.error(f"Chunk Error Daybook ({start_date}-{end_date}): {e}")
             
         # Breathing gap for Tally single-threaded event loop
         time.sleep(0.5)
+
+    if failed_chunks:
+        logging.error(
+            f"Daybook fetch incomplete: {len(failed_chunks)}/{total_chunks} chunks failed "
+            f"({', '.join(failed_chunks)}). Results below are partial."
+        )
 
     unique_entries = {}
     for entry in daybook_list:
@@ -378,6 +398,7 @@ def get_daybook(company_name: str = None):
 
 def save_daybook_to_supabase(daybook_entries=None, company_name=None):
     if not daybook_entries:
+        logging.info("No daybook entries to save.")
         return 0
 
     comp_name = company_name or (daybook_entries[0].get("company_name", "") if daybook_entries else "")
@@ -441,7 +462,7 @@ def reconcile_deleted_daybook(company_name: str) -> int:
             timeout=180
         )
         response.raise_for_status()
-        xml_content = clean_tally_xml(response.text)
+        xml_content = clean_tally_xml(decode_response(response))
         data = xmltodict.parse(xml_content)
         collection = (
             data.get("ENVELOPE", {})
@@ -464,11 +485,11 @@ def reconcile_deleted_daybook(company_name: str) -> int:
                 tally_active_guids.add(g)
 
     except Exception as e:
-        logging.warning(f"Could not fetch active Daybook GUIDs from Tally for reconciliation: {e}")
+        logging.error(f"Could not fetch active Daybook GUIDs from Tally; deletion reconciliation SKIPPED: {e}")
         return 0
 
     if not tally_active_guids:
-        logging.warning("Tally returned 0 active Daybook GUIDs; skipping reconciliation to prevent mass-deletion.")
+        logging.error("Tally returned 0 active Daybook GUIDs; skipping reconciliation to prevent mass-deletion.")
         return 0
 
     from .local_db import reconcile_local_deletions

@@ -9,6 +9,13 @@ from xml.sax.saxutils import escape
 from supabase import create_client
 
 from .config import load_config
+from .source_values import (
+    clean_source_xml,
+    decode_response,
+    effective_dict,
+    reconcile_from_id,
+    source_number,
+)
 from .tally_companies import get_company_details
 
 
@@ -54,47 +61,13 @@ def get_text(value):
 
 
 def safe_float(value, default=0):
-
-    try:
-
-        value = get_text(value)
-
-        value = value.replace(",", "")
-
-        is_neg = "-" in value or "(-" in value
-
-        match = re.search(
-            r"\d+(\.\d+)?",
-            value
-        )
-
-        if not match:
-            return default
-
-        num = float(match.group())
-        return -num if is_neg else num
-
-    except Exception:
-
-        return default
+    """Native Tally numeric read: honours Dr/Cr suffixes and converted INR values."""
+    return source_number(value, default)
 
 
 def clean_tally_xml(xml_text):
-    """Remove invalid XML character refs and fix stray ampersands."""
-
-    xml_text = re.sub(
-        r'&#(?:x[0-9A-Fa-f]+|\d+);',
-        '',
-        xml_text
-    )
-
-    xml_text = re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;)",
-        "&amp;",
-        xml_text
-    )
-
-    return xml_text
+    """Strip only illegal control characters, keeping legal character references."""
+    return clean_source_xml(xml_text)
 
 
 def extract_gst_rate(item):
@@ -178,10 +151,13 @@ def get_stock_group_gst_rates(company_name: str = "Unknown"):
             timeout=120
         )
         response.raise_for_status()
-        response_text = clean_tally_xml(response.text)
+        response_text = clean_tally_xml(decode_response(response))
         data = xmltodict.parse(response_text)
     except Exception as e:
-        logging.error(f"Error fetching Stock Group GST rates: {e}")
+        logging.error(
+            f"Error fetching Stock Group GST rates for {company_name}; "
+            f"group-inherited GST rates will be missing: {e}"
+        )
         return {}
         
     collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
@@ -193,11 +169,17 @@ def get_stock_group_gst_rates(company_name: str = "Unknown"):
     group_rates = {}
     for group in stock_groups:
         name = get_text(group.get("@NAME"))
-        if name:
+        if not name:
+            continue
+        try:
             rate = extract_gst_rate(group)
-            if rate > 0:
-                group_rates[name] = rate
-                
+        except Exception as e:
+            logging.error(f"Error reading GST rate for stock group '{name}': {e}")
+            continue
+        if rate > 0:
+            group_rates[name] = rate
+
+
     # Deep parent inheritance resolution (recursive)
     changed = True
     while changed:
@@ -224,6 +206,15 @@ def get_max_alter_id(table_name: str, company_name: str) -> int:
         logging.error(f"Failed to fetch max alter_id for {table_name}: {e}")
     return 0
 
+def _integer_quantity(qty) -> int:
+    """ItemQuantity is an integer column; refuse to silently truncate fractions."""
+    if not float(qty).is_integer():
+        raise ValueError(
+            f"Fractional stock quantity {qty} requires a numeric quantity column"
+        )
+    return int(qty)
+
+
 def _qty_rate_from_closing(item) -> tuple:
     """
     Build signed qty + positive rate so (qty * rate) equals Tally CLOSINGVALUE.
@@ -236,7 +227,7 @@ def _qty_rate_from_closing(item) -> tuple:
         rate = abs(val / qty)
     elif qty == 0:
         rate = abs(rate)
-    qty_out = int(round(qty))
+    qty_out = _integer_quantity(qty)
     # Keep enough decimals so sum(qty*rate) matches Tally to the paisa
     rate_out = round(rate, 6)
     return qty_out, rate_out
@@ -291,7 +282,7 @@ def sync_stock_item_balances(company_name: str):
             timeout=120
         )
         response.raise_for_status()
-        data = xmltodict.parse(clean_tally_xml(response.text))
+        data = xmltodict.parse(clean_tally_xml(decode_response(response)))
         collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
         items = collection.get("STOCKITEM", [])
         if isinstance(items, dict):
@@ -304,6 +295,7 @@ def sync_stock_item_balances(company_name: str):
         conn = get_connection()
         updated_count = 0
         unmatched = 0
+        unreadable = 0
         try:
             # Ensure ItemQuantity / ItemRate columns exist even if masters were never staged
             cols = {r["name"].lower() for r in conn.execute('PRAGMA table_info("stock_items")').fetchall()} if conn.execute(
@@ -321,9 +313,15 @@ def sync_stock_item_balances(company_name: str):
                     conn.execute('ALTER TABLE "stock_items" ADD COLUMN "ItemName" TEXT')
 
                 for it in items:
-                    qty_int, rate = _qty_rate_from_closing(it)
-                    guid = get_text(it.get("GUID"))
                     name = get_text(it.get("@NAME") or it.get("NAME"))
+                    try:
+                        qty_int, rate = _qty_rate_from_closing(it)
+                    except Exception as e:
+                        # One unreadable item must not abandon every other balance.
+                        unreadable += 1
+                        logging.error(f"Error reading stock balance for '{name}': {e}")
+                        continue
+                    guid = get_text(it.get("GUID"))
                     cur = None
                     if guid:
                         cur = conn.execute(
@@ -348,12 +346,13 @@ def sync_stock_item_balances(company_name: str):
 
         logging.info(
             f"[LocalDB] Stock balances refreshed for {company_name}: "
-            f"updated={updated_count}, unmatched={unmatched}, tally_items={len(items)}"
+            f"updated={updated_count}, unmatched={unmatched}, unreadable={unreadable}, "
+            f"tally_items={len(items)}"
         )
         return updated_count
 
     except Exception as e:
-        logging.warning(f"Stock item balance feed failed: {e}")
+        logging.error(f"Stock item balance feed failed for {company_name}: {e}")
         return 0
 
 def _fetch_all_stock_guids(company_name: str) -> set:
@@ -392,7 +391,7 @@ def _fetch_all_stock_guids(company_name: str) -> set:
         timeout=120,
     )
     response.raise_for_status()
-    data = xmltodict.parse(clean_tally_xml(response.text))
+    data = xmltodict.parse(clean_tally_xml(decode_response(response)))
     collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
     items = collection.get("STOCKITEM", [])
     if isinstance(items, dict):
@@ -413,7 +412,8 @@ def get_stock_items(company_name: str = None):
         company_name = company_details.get("company_name", "Unknown") if company_details else "Unknown"
 
     from .local_db import get_max_alter_id_local, get_local_guids
-    max_alter_id = get_max_alter_id_local("stock_items", company_name)
+    # FULL_RECONCILE=1 forces the watermark back to 0 for a complete re-read.
+    max_alter_id = reconcile_from_id(get_max_alter_id_local("stock_items", company_name))
     # Backfill items missed on earlier syncs (incremental alter_id gaps).
     missing_count = 0
     try:
@@ -462,7 +462,7 @@ def get_stock_items(company_name: str = None):
                 <TDLMESSAGE>
                     <COLLECTION NAME="Stock Item Collection">
                         <TYPE>Stock Item</TYPE>
-                        <FETCH>NAME, MASTERID, GUID, PARENT, BASEUNITS, ADDITIONALUNITS, PARTNO, PARTNUMBER, ITEMCODE, MAILINGNAME.LIST, CATEGORY, HSNCODE, GSTHSN, DESCRIPTION, ADDITIONALDESCRIPTION, OPENINGBALANCE, OPENINGRATE, VATRATE, IGSTRATE, GSTDETAILS.LIST, MRP, MAXIMUMRETAILPRICE, STANDARDCOST, STANDARDPRICE, OPENINGVALUE, MINIMUMSALESPRICE, DISCOUNT, ISDELETED, LANGUAGENAME.LIST, CLOSINGBALANCE, CLOSINGRATE, CLOSINGVALUE, ALTERID</FETCH>
+                        <FETCH>NAME, MASTERID, GUID, PARENT, BASEUNITS, ADDITIONALUNITS, PARTNO, PARTNUMBER, ITEMCODE, MAILINGNAME.LIST, CATEGORY, HSNCODE, GSTHSN, HSNDETAILS.LIST, DESCRIPTION, ADDITIONALDESCRIPTION, OPENINGBALANCE, OPENINGRATE, VATRATE, IGSTRATE, GSTDETAILS.LIST, MRP, MAXIMUMRETAILPRICE, MRPDETAILS.LIST, STANDARDCOST, STANDARDPRICE, OPENINGVALUE, MINIMUMSALESPRICE, DISCOUNT, ISDELETED, LANGUAGENAME.LIST, CLOSINGBALANCE, CLOSINGRATE, CLOSINGVALUE, ALTERID</FETCH>
                         {filter_tag}
                     </COLLECTION>
                     {formula_tag}
@@ -482,14 +482,16 @@ def get_stock_items(company_name: str = None):
         timeout=300
     )
     response.raise_for_status()
-    response_text = clean_tally_xml(response.text)
-    
+    response_text = clean_tally_xml(decode_response(response))
+
     try:
         data = xmltodict.parse(response_text)
     except Exception as e:
-        logging.error(f"Error parsing Tally XML response: {e}")
-        return []
-        
+        # An unparseable master feed is a failure, not "no stock items changed".
+        logging.error(f"Error parsing Tally stock item XML response: {e}")
+        raise
+
+
     collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
     stock_items = collection.get("STOCKITEM", [])
     
@@ -526,15 +528,24 @@ def get_stock_items(company_name: str = None):
                 gst_rate = group_gst_rates.get(item_parent, 0.0)
             
             qty, rate = _qty_rate_from_closing(item)
+            closing_value = safe_float(item.get("CLOSINGVALUE"), 0)
             # Master fetch may be incremental without closing fields; fall back to opening
             if qty == 0 and rate == 0:
-                qty = int(round(safe_float(item.get("OPENINGBALANCE"), 0)))
+                qty = _integer_quantity(safe_float(item.get("OPENINGBALANCE"), 0))
                 oval = safe_float(item.get("OPENINGVALUE"), 0)
                 orate = abs(safe_float(item.get("OPENINGRATE"), 0))
                 if qty != 0 and oval != 0:
                     rate = round(abs(oval / qty), 6)
                 else:
                     rate = round(orate, 6)
+                if closing_value == 0:
+                    closing_value = oval
+
+            # Tally returns a dated history for HSN and MRP; take today's entry.
+            hsn_detail = effective_dict(item.get("HSNDETAILS.LIST"))
+            mrp = safe_float(effective_dict(item.get("MRPDETAILS.LIST")).get("MRPRATE"), 0)
+            if not mrp:
+                mrp = safe_float(item.get("MRP")) or safe_float(item.get("MAXIMUMRETAILPRICE"))
 
             row = {
                 "company_name": company_name,
@@ -545,12 +556,13 @@ def get_stock_items(company_name: str = None):
                 "ItemParent": item_parent,
                 "Category": get_text(item.get("CATEGORY")) or None,
                 "Alias": aliases[0] if len(aliases) > 0 else None,
-                "hsn": get_text(item.get("HSNCODE")) or get_text(item.get("GSTHSN")) or None,
+                "hsn": get_text(hsn_detail.get("HSNCODE")) or get_text(item.get("HSNCODE")) or get_text(item.get("GSTHSN")) or None,
                 "Description": get_text(item.get("DESCRIPTION")) or get_text(item.get("ADDITIONALDESCRIPTION")) or None,
                 "ItemQuantity": qty,
                 "ItemRate": rate,
+                "ClosingValue": -closing_value,
                 "GstRate": gst_rate,
-                "MRP": safe_float(item.get("MRP")) or safe_float(item.get("MAXIMUMRETAILPRICE")),
+                "MRP": mrp,
                 "StandardCost": safe_float(item.get("STANDARDCOST")),
                 "StandardPrice": safe_float(item.get("STANDARDPRICE")),
                 "OpeningValue": safe_float(item.get("OPENINGVALUE")),
@@ -566,8 +578,17 @@ def get_stock_items(company_name: str = None):
             }
             all_stock_items.append(row)
         except Exception as e:
-            logging.error(f"Error parsing stock item: {e}")
-            
+            # Skip the unreadable item but keep the rest of the master fetch going.
+            logging.error(
+                f"Error parsing stock item '{get_text(item.get('@NAME') or item.get('NAME'))}': {e}"
+            )
+
+    if stock_items and not all_stock_items:
+        raise RuntimeError(
+            f"Tally returned {len(stock_items)} stock item(s) for {company_name} "
+            "but none could be parsed"
+        )
+
     return all_stock_items
 
 def save_stock_items_to_supabase(stock_items, company_name: str = None):
@@ -584,7 +605,7 @@ def save_stock_items_to_supabase(stock_items, company_name: str = None):
             bal = sync_stock_item_balances(comp_name)
             logging.info(f"[StockItems] Post-save balance refresh wrote {bal} row(s) for {comp_name}")
         except Exception as e:
-            logging.warning(f"Post-save stock balance refresh skipped: {e}")
+            logging.error(f"Post-save stock balance refresh failed for {comp_name}: {e}")
     return staged
 
 
@@ -629,7 +650,7 @@ def reconcile_deleted_stock_items(company_name: str) -> int:
             timeout=120
         )
         response.raise_for_status()
-        xml_content = clean_tally_xml(response.text)
+        xml_content = clean_tally_xml(decode_response(response))
         data = xmltodict.parse(xml_content)
         collection = (
             data.get("ENVELOPE", {})
@@ -652,7 +673,11 @@ def reconcile_deleted_stock_items(company_name: str) -> int:
                 tally_active_guids.add(g)
 
     except Exception as e:
-        logging.warning(f"Could not fetch active Stock Item GUIDs from Tally for reconciliation: {e}")
+        # Returning 0 is the safe outcome, but it is a failure and not "nothing deleted".
+        logging.error(
+            f"Could not fetch active Stock Item GUIDs from Tally for {company_name}; "
+            f"deletion reconciliation skipped this cycle: {e}"
+        )
         return 0
 
     from .local_db import reconcile_local_deletions

@@ -1,3 +1,4 @@
+from .source_values import clean_source_xml, decode_response, source_number, reconcile_from_id
 import logging
 import time
 import requests
@@ -41,12 +42,7 @@ def get_text(value):
 def clean_tally_xml(xml_text):
     if not xml_text:
         return ""
-    xml_text = re.sub(r'&#x[0-9A-Fa-f]+;', '', xml_text)
-    xml_text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', xml_text)
-    xml_text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_text)
-    # Strip XML namespace prefixes (e.g. <UDF:FIELD> → <FIELD>)
-    xml_text = re.sub(r'<(/?)[A-Za-z][\w]*:([\w]+)', r'<\1\2', xml_text)
-    return xml_text
+    return clean_source_xml(xml_text)
 
 
 def parse_tally_date(date_str):
@@ -63,27 +59,27 @@ def parse_tally_date(date_str):
 
 def get_max_alter_id(supabase, company_name: str) -> int:
     from .local_db import get_max_alter_id_local
-    return get_max_alter_id_local("ledger_bill_settlements", company_name)
+    return reconcile_from_id(get_max_alter_id_local("ledger_bill_settlements", company_name))
 
 
 def fetch_all_customers(supabase, company_name: str) -> list:
     """Fetch all customer names with original casing from local SQLite 'customers' table."""
+    if not company_name or not str(company_name).strip():
+        return []
+
+    from .local_db import get_connection
+    conn = get_connection()
     try:
-        from .local_db import get_connection
-        conn = get_connection()
-        try:
-            if not company_name or not str(company_name).strip():
-                return []
-            rows = conn.execute(
-                'SELECT customer_name FROM "customers" WHERE company_name = ?',
-                (company_name.strip(),)
-            ).fetchall()
-            return [r["customer_name"].strip() for r in rows if r["customer_name"]]
-        finally:
-            conn.close()
-    except Exception:
-        pass
-    return []
+        rows = conn.execute(
+            'SELECT customer_name FROM "customers" WHERE company_name = ?',
+            (company_name.strip(),)
+        ).fetchall()
+    except Exception as e:
+        logging.error(f"Failed to read local customers for {company_name}: {e}")
+        raise
+    finally:
+        conn.close()
+    return [r["customer_name"].strip() for r in rows if r["customer_name"]]
 
 
 # =====================================================
@@ -116,47 +112,47 @@ def fetch_lpp_for_ledger(tally_url: str, company_name: str, ledger_name: str) ->
     </ENVELOPE>
     """
     local_bills = []
-    try:
-        resp = requests.post(
-            tally_url,
-            data=xml_req.encode("utf-8"),
-            headers={"Content-Type": "application/xml", "Connection": "close"},
-            timeout=15
-        )
-        if resp.status_code != 200 or not resp.text.strip():
-            return []
+    resp = requests.post(
+        tally_url,
+        data=xml_req.encode("utf-8"),
+        headers={"Content-Type": "application/xml", "Connection": "close"},
+        timeout=15
+    )
+    resp.raise_for_status()
+    body = decode_response(resp)
+    if not body.strip():
+        raise ValueError(f"Empty Ledger Payment Performance response for '{ledger_name}'")
 
-        c_xml = clean_tally_xml(resp.text)
-        r_elem = ET.fromstring(c_xml)
-        c_bill = None
+    c_xml = clean_tally_xml(body)
+    r_elem = ET.fromstring(c_xml)
+    c_bill = None
 
-        for child in r_elem:
-            tag = child.tag
-            text = (child.text or "").strip()
-            if tag == "LPPDATE":
-                if c_bill and c_bill.get("cleared_date"):
-                    c_bill["ledger_name"] = ledger_name
-                    local_bills.append(c_bill)
-                c_bill = {"bill_date": text, "bill_amount": 0.0}
-            elif c_bill:
-                if tag == "LPPNAME":
-                    c_bill["bill_reference"] = text
-                elif tag == "LPPCLEAREDDATE":
-                    c_bill["cleared_date"] = text
-                elif tag == "LPPDUEON":
-                    c_bill["due_date"] = text
-                elif tag == "BILLVCHAMOUNT" and c_bill["bill_amount"] == 0.0:
-                    try:
-                        c_bill["bill_amount"] = abs(float(text))
-                    except ValueError:
-                        pass
+    for child in r_elem:
+        tag = child.tag
+        text = (child.text or "").strip()
+        if tag == "LPPDATE":
+            if c_bill and c_bill.get("cleared_date"):
+                c_bill["ledger_name"] = ledger_name
+                local_bills.append(c_bill)
+            c_bill = {"bill_date": text, "bill_amount": 0.0}
+        elif c_bill:
+            if tag == "LPPNAME":
+                c_bill["bill_reference"] = text
+            elif tag == "LPPCLEAREDDATE":
+                c_bill["cleared_date"] = text
+            elif tag == "LPPDUEON":
+                c_bill["due_date"] = text
+            elif tag == "BILLVCHAMOUNT" and c_bill["bill_amount"] == 0.0:
+                try:
+                    c_bill["bill_amount"] = abs(source_number(text))
+                except ValueError as e:
+                    logging.error(
+                        f"Unreadable bill amount '{text}' for ledger '{ledger_name}': {e}"
+                    )
 
-        if c_bill and c_bill.get("cleared_date"):
-            c_bill["ledger_name"] = ledger_name
-            local_bills.append(c_bill)
-
-    except Exception:
-        pass
+    if c_bill and c_bill.get("cleared_date"):
+        c_bill["ledger_name"] = ledger_name
+        local_bills.append(c_bill)
 
     return local_bills
 
@@ -210,6 +206,8 @@ def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int)
     chunks_to_query = date_ranges if max_alter_id == 0 else [(date_ranges[0][0], date_ranges[-1][1])]
 
     affected = {}
+    failed_chunks = 0
+    ok_chunks = 0
 
     for c_start, c_end in chunks_to_query:
         xml_request = f"""<ENVELOPE>
@@ -258,7 +256,7 @@ def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int)
                 timeout=45
             )
             response.raise_for_status()
-            xml_content = clean_tally_xml(response.text)
+            xml_content = clean_tally_xml(decode_response(response))
             data = xmltodict.parse(xml_content)
 
             envelope = data.get("ENVELOPE") or {} if isinstance(data, dict) else {}
@@ -285,8 +283,25 @@ def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int)
                     if ledger_name and (ledger_name not in affected or alter_id > affected[ledger_name]):
                         affected[ledger_name] = alter_id
 
+            ok_chunks += 1
+
         except Exception as e:
-            logging.warning(f"Error fetching payment activity chunk ({c_start}-{c_end}) from Tally: {e}")
+            failed_chunks += 1
+            logging.error(f"Error fetching payment activity chunk ({c_start}-{c_end}) from Tally: {e}")
+
+    # An empty result only means "no new activity" if at least one chunk was
+    # actually read. If every chunk failed, saying "up to date" would be a lie.
+    if failed_chunks and not ok_chunks:
+        raise RuntimeError(
+            f"Payment activity scan failed for all {failed_chunks} date chunk(s); "
+            "cannot determine affected ledgers"
+        )
+    if failed_chunks:
+        logging.error(
+            f"Payment activity scan incomplete: {failed_chunks} of "
+            f"{failed_chunks + ok_chunks} date chunk(s) failed; "
+            "some settled bills may be missed this run"
+        )
 
     return affected
 
@@ -318,12 +333,24 @@ def full_load_all_customers(tally_url: str, company_name: str, customers: list,
     if total_cust == 0:
         return []
 
+    failed = []
     for idx, ledger_name in enumerate(target_customers, 1):
         if idx % 10 == 0 or idx == total_cust:
             logging.info(f"Settled bills progress: [{idx}/{total_cust}] ledgers...")
-        bills = fetch_lpp_for_ledger(tally_url, company_name, ledger_name)
+        try:
+            bills = fetch_lpp_for_ledger(tally_url, company_name, ledger_name)
+        except Exception as e:
+            failed.append(ledger_name)
+            logging.error(f"Failed to fetch settled bills for ledger '{ledger_name}': {e}")
+            continue
         time.sleep(0.05)
         all_rows.extend(format_bills(bills, company_name, current_alter_id, now_ts))
+
+    if failed:
+        logging.error(
+            f"Settled bills: {len(failed)} of {total_cust} ledger(s) could not be read "
+            f"from Tally (e.g. {', '.join(failed[:5])})"
+        )
 
     return all_rows
 
@@ -344,9 +371,20 @@ def incremental_load_affected(tally_url: str, company_name: str,
     )
 
     all_rows = []
+    failed = []
     from .local_db import get_connection
     for ledger_name, receipt_alter_id in affected_ledgers.items():
-        # Delete old records from local SQLite first (handles deleted receipts in Tally)
+        # Read fresh data before purging the local rows, so a failed fetch can
+        # never leave the ledger with no settlements at all.
+        try:
+            bills = fetch_lpp_for_ledger(tally_url, company_name, ledger_name)
+        except Exception as e:
+            failed.append(ledger_name)
+            logging.error(f"Failed to fetch settled bills for ledger '{ledger_name}': {e}")
+            continue
+        time.sleep(0.05)
+
+        # Delete old records from local SQLite (handles deleted receipts in Tally)
         try:
             conn = get_connection()
             with conn:
@@ -358,9 +396,13 @@ def incremental_load_affected(tally_url: str, company_name: str,
         except Exception as e:
             logging.error(f"Failed to delete old local records for {ledger_name}: {e}")
 
-        bills = fetch_lpp_for_ledger(tally_url, company_name, ledger_name)
-        time.sleep(0.05)
         all_rows.extend(format_bills(bills, company_name, receipt_alter_id, now_ts))
+
+    if failed:
+        logging.error(
+            f"Settled bills: {len(failed)} of {len(affected_ledgers)} affected ledger(s) "
+            f"could not be read from Tally (e.g. {', '.join(failed[:5])})"
+        )
 
     return all_rows
 
@@ -431,4 +473,4 @@ def sync_settled_bills(company_name: str = None):
 
     except Exception as e:
         logging.error(f"Error syncing settled bills: {e}", exc_info=True)
-        return 0
+        raise

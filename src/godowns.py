@@ -1,3 +1,4 @@
+from .source_values import clean_source_xml, decode_response, reconcile_from_id
 import logging
 import re
 import requests
@@ -27,9 +28,9 @@ def get_text(value):
     return clean_text(value)
 
 def clean_tally_xml(xml_text):
-    xml_text = re.sub(r'&#(?:x[0-9A-Fa-f]+|\d+);', '', xml_text)
-    xml_text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_text)
-    return xml_text
+    if not xml_text:
+        return ""
+    return clean_source_xml(xml_text)
 
 def get_max_alter_id(table_name: str, company_name: str) -> int:
     try:
@@ -49,7 +50,7 @@ def get_godowns(company_name: str = None):
         company_name = company_details.get("company_name", "Unknown") if company_details else "Unknown"
 
     from .local_db import get_max_alter_id_local
-    max_alter_id = get_max_alter_id_local("tally_godowns", company_name)
+    max_alter_id = reconcile_from_id(get_max_alter_id_local("tally_godowns", company_name))
     filter_tag = "<FILTER>AlterIdFilter</FILTER>" if max_alter_id > 0 else ""
     formula_tag = f'<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterId &gt; {max_alter_id}</SYSTEM>' if max_alter_id > 0 else ""
 
@@ -95,18 +96,16 @@ def get_godowns(company_name: str = None):
         response.raise_for_status()
     except Exception as e:
         logging.error(f"Error fetching Godowns from Tally: {e}")
-        return []
+        raise
 
     try:
-        clean_xml = re.sub(r'&#x[0-9A-Fa-f]+;', '', response.text)
-        clean_xml = re.sub(r'&#\d+;', '', clean_xml)
+        clean_xml = clean_tally_xml(decode_response(response))
         clean_xml = clean_xml.replace('encoding="utf-16"', 'encoding="utf-8"')
-        clean_xml = clean_xml.replace('\x00', '')
         parsed_data = xmltodict.parse(clean_xml)
         collection = parsed_data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {}).get("GODOWN", [])
     except Exception as e:
         logging.error(f"Error parsing XML for Godowns: {e}")
-        return []
+        raise
 
     if not isinstance(collection, list):
         collection = [collection]
@@ -193,7 +192,7 @@ def reconcile_deleted_godowns(company_name: str) -> int:
             timeout=120
         )
         response.raise_for_status()
-        clean_xml = clean_tally_xml(response.text)
+        clean_xml = clean_tally_xml(decode_response(response))
         data = xmltodict.parse(clean_xml)
         collection = (
             data.get("ENVELOPE", {})
@@ -216,8 +215,8 @@ def reconcile_deleted_godowns(company_name: str) -> int:
                 tally_active_guids.add(g)
 
     except Exception as e:
-        logging.warning(f"Could not fetch active Godown GUIDs from Tally for reconciliation: {e}")
-        return 0
+        logging.error(f"Could not fetch active Godown GUIDs from Tally for reconciliation: {e}")
+        raise
 
     from .local_db import reconcile_local_deletions
     return reconcile_local_deletions("tally_godowns", tally_active_guids, company_name)

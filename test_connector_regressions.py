@@ -37,7 +37,12 @@ class ConnectorRegressionTests(unittest.TestCase):
     def test_company_currency_is_native(self):
         self.assertEqual(company_currency({'BASECURRENCYNAME':'₹'}),'INR')
         with patch.dict(os.environ,{'TALLY_BASE_CURRENCY':''}):
-            with self.assertRaises(ValueError):company_currency({})
+            # Tally's own value still wins over the baked-in default.
+            self.assertEqual(company_currency({'BASECURRENCYNAME':'AED'}),'AED')
+            # Omitted currency falls back to the hardcoded default, not to AED.
+            self.assertEqual(company_currency({}),'INR')
+            # An unrecognised currency is still refused rather than mislabelled.
+            with self.assertRaises(ValueError):company_currency({'BASECURRENCYNAME':'XYZ'})
     def test_explicit_currency_when_native_export_omits_it(self):
         with patch.dict(os.environ,{'TALLY_BASE_CURRENCY':'INR'}):self.assertEqual(company_currency({}),'INR')
     def test_sales_gst_from_all_ledger_entries(self):
