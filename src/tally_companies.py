@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from supabase import create_client
 
 from .config import load_config
+from .source_values import clean_source_xml, company_currency, decode_response
 
 
 # =====================================================
@@ -119,21 +120,7 @@ def get_address_parts(item):
 
 
 def clean_tally_xml(xml_text):
-    """Remove invalid XML character refs and fix stray ampersands."""
-
-    xml_text = re.sub(
-        r'&#(?:x[0-9A-Fa-f]+|\d+);',
-        '',
-        xml_text
-    )
-
-    xml_text = re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;)",
-        "&amp;",
-        xml_text
-    )
-
-    return xml_text
+    return clean_source_xml(xml_text)
 
 
 # =====================================================
@@ -153,7 +140,7 @@ def extract_company_dict(company):
         "address_line2": address_parts[1] if len(address_parts) > 1 else None,
         "city": address_parts[2] if len(address_parts) > 2 else None,
         "emirate": get_text_or_none(company.get("STATENAME")),
-        "country": get_text_or_none(company.get("COUNTRYNAME")) or "UAE",
+        "country": get_text_or_none(company.get("COUNTRYNAME")),
         "pin_code": get_text_or_none(company.get("PINCODE")),
         "mobile_number": (
             get_text_or_none(company.get("MOBILENO"))
@@ -166,7 +153,7 @@ def extract_company_dict(company):
         "trn_number": get_text_or_none(company.get("GSTREGISTRATIONNUMBER")),
         "trade_license_number": get_text_or_none(company.get("CRNUMBER")),
         "trade_license_expiry": None,
-        "base_currency": "AED",
+        "base_currency": company_currency(company),
         "books_from": format_tally_date(books_from),
         "financial_year_from": format_tally_date(books_from),
         "is_active": True,
@@ -212,7 +199,7 @@ def get_all_companies_details():
     )
     response.raise_for_status()
 
-    xml_content = clean_tally_xml(response.text)
+    xml_content = clean_tally_xml(decode_response(response))
     data = xmltodict.parse(xml_content)
 
     collection = (

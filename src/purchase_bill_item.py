@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import re
 import requests
 import time
@@ -11,6 +11,13 @@ from supabase import create_client
 from .config import load_config
 from .tally_companies import get_company_details
 from .local_db import stage_records, get_pending_records, mark_as_synced, mark_as_failed
+from .source_values import (
+    clean_source_xml,
+    decode_response,
+    inventory_tax,
+    reconcile_from_id,
+    source_number,
+)
 
 
 # =====================================================
@@ -38,22 +45,13 @@ def get_text(value):
 
 
 def parse_float(value, default=0.0):
-    if value is None:
-        return default
-    value = get_text(value).replace(",", "").strip()
-    match = re.search(r"-?\d+(\.\d+)?", value)
-    if not match:
-        return default
-    try:
-        return float(match.group())
-    except ValueError:
-        return default
+    return source_number(value, default)
 
 
 def parse_qty(raw):
     """
-    Parse quantity from Tally format e.g. '5.00 Nos' → 5.0.
-    Tally appends the unit name after a space — take only the numeric part.
+    Parse quantity from Tally format e.g. '5.00 Nos' â†’ 5.0.
+    Tally appends the unit name after a space â€” take only the numeric part.
     """
     if not raw:
         return 0.0
@@ -64,9 +62,7 @@ def parse_qty(raw):
 
 
 def clean_tally_xml(xml_text):
-    xml_text = re.sub(r'&#(?:x[0-9A-Fa-f]+|\d+);', '', xml_text)
-    xml_text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_text)
-    return xml_text
+    return clean_source_xml(xml_text)
 
 
 def fetch_all(supabase, table, columns, company_name=None):
@@ -153,29 +149,7 @@ def resolve_discount(entry):
 
 
 def resolve_tax(entry, quantity, unit_price):
-    tax_pct = 0.0
-    
-    gsts = entry.get("GSTOVRDNLEDGERS.LIST")
-    if gsts:
-        if isinstance(gsts, dict):
-            gsts = [gsts]
-        for gst in gsts:
-            pct = parse_float(gst.get("TAXRATE"))
-            if pct:
-                tax_pct = pct
-                break
-
-    line_amount = abs(parse_float(entry.get("AMOUNT")))
-    base = quantity * unit_price
-
-    if line_amount and line_amount > base:
-        tax_amount = round(line_amount - base, 2)
-    elif tax_pct:
-        tax_amount = round(base * tax_pct / 100, 2)
-    else:
-        tax_amount = 0.0
-
-    return round(tax_pct, 2), tax_amount
+    return inventory_tax(entry, quantity, unit_price)
 
 
 # =====================================================
@@ -209,7 +183,7 @@ def get_purchase_bill_items(company_name: str = None):
     date_ranges = get_current_fy_item_date_ranges(days_per_chunk=7)
 
     # Determine checkpoint locally from SQLite
-    max_alter_id = get_max_alter_id_local("invoice_items_purchase", company_name)
+    max_alter_id = reconcile_from_id(get_max_alter_id_local("invoice_items_purchase", company_name))
     logging.info(f"Purchase items incremental sync from alter_id > {max_alter_id}")
     
     logging.info(f"Fetching purchase bill items in {len(date_ranges)} chunks (7-day intervals)...")
@@ -256,7 +230,11 @@ def get_purchase_bill_items(company_name: str = None):
                             ISCANCELLED,
                             ALTERID,
                             ALLINVENTORYENTRIES.LIST,
-                            INVENTORYENTRIES.LIST
+                            ALLINVENTORYENTRIES.RATEDETAILS.GSTRATE,
+                            ALLINVENTORYENTRIES.RATEDETAILS.GSTRATEDUTYHEAD,
+                            INVENTORYENTRIES.LIST,
+                            INVENTORYENTRIES.RATEDETAILS.GSTRATE,
+                            INVENTORYENTRIES.RATEDETAILS.GSTRATEDUTYHEAD
                         </FETCH>
                         <FILTER>DateFilter</FILTER>
                         {alter_filter_tag}
@@ -278,7 +256,7 @@ def get_purchase_bill_items(company_name: str = None):
             )
             response.raise_for_status()
 
-            xml_content = clean_tally_xml(response.text)
+            xml_content = clean_tally_xml(decode_response(response))
             data = xmltodict.parse(xml_content)
 
             collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
@@ -321,13 +299,20 @@ def get_purchase_bill_items(company_name: str = None):
                         continue
 
                     quantity = resolve_quantity(entry)
+                    if not float(quantity).is_integer():
+                        raise ValueError("Fractional purchase quantity requires a numeric quantity column")
                     unit_price = resolve_rate(entry)
                     discount_pct, discount_amount = resolve_discount(entry)
 
                     if discount_pct and not discount_amount:
                         discount_amount = round(quantity * unit_price * discount_pct / 100, 2)
 
-                    subtotal = round((quantity * unit_price) - discount_amount, 2)
+                    subtotal = round(
+                        abs(source_number(entry.get("AMOUNT")))
+                        if get_text(entry.get("AMOUNT"))
+                        else (quantity * unit_price) - discount_amount,
+                        2,
+                    )
                     tax_pct, tax_amount = resolve_tax(entry, quantity, unit_price)
                     line_total = round(subtotal + tax_amount, 2)
 
@@ -362,8 +347,8 @@ def get_purchase_bill_items(company_name: str = None):
         # Breathing gap for Tally single-threaded event loop
         time.sleep(0.5)
 
-    logging.info(f"Skipped {skipped_no_bill} vouchers — no matching purchase_invoice in Supabase")
-    logging.info(f"Skipped {skipped_no_items} vouchers — no inventory entries found")
+    logging.info(f"Skipped {skipped_no_bill} vouchers â€” no matching purchase_invoice in Supabase")
+    logging.info(f"Skipped {skipped_no_items} vouchers â€” no inventory entries found")
 
     return items_list
 

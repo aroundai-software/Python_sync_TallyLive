@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import re
 import requests
 import time
@@ -11,6 +11,14 @@ from supabase import create_client
 from .config import load_config
 from .tally_companies import get_company_details
 from .local_db import stage_records, get_pending_records, mark_as_synced, mark_as_failed
+from .source_values import (
+    clean_source_xml,
+    decode_response,
+    gst_names_xml,
+    invoice_tax,
+    reconcile_from_id,
+    source_number,
+)
 
 
 # =====================================================
@@ -61,26 +69,7 @@ def get_text_or_none(value):
 
 
 def safe_float(value, default=0):
-
-    try:
-
-        value = get_text(value)
-
-        value = value.replace(",", "")
-
-        match = re.search(
-            r"-?\d+(\.\d+)?",
-            value
-        )
-
-        if not match:
-            return default
-
-        return float(match.group())
-
-    except Exception:
-
-        return default
+    return source_number(value, default)
 
 
 def format_tally_date(value):
@@ -103,21 +92,7 @@ def format_tally_date(value):
 
 
 def clean_tally_xml(xml_text):
-    """Remove invalid XML character refs and fix stray ampersands."""
-
-    xml_text = re.sub(
-        r'&#(?:x[0-9A-Fa-f]+|\d+);',
-        '',
-        xml_text
-    )
-
-    xml_text = re.sub(
-        r"&(?!amp;|lt;|gt;|quot;|apos;)",
-        "&amp;",
-        xml_text
-    )
-
-    return xml_text
+    return clean_source_xml(xml_text)
 
 
 def get_tax_ledgers(company_name: str):
@@ -139,9 +114,11 @@ def get_tax_ledgers(company_name: str):
                 <TDLMESSAGE>
                     <COLLECTION NAME="TaxLedgers">
                         <TYPE>Ledger</TYPE>
-                        <CHILDOF>$$DutiesAndTaxes</CHILDOF>
-                        <FETCH>NAME</FETCH>
+                        <FETCH>NAME,TAXTYPE</FETCH>
+                        <FILTER>GSTTaxLedgers</FILTER>
+                        <BELONGSTO>Yes</BELONGSTO>
                     </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="GSTTaxLedgers">$TaxType = "GST"</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>
@@ -157,47 +134,16 @@ def get_tax_ledgers(company_name: str):
             timeout=60
         )
         response.raise_for_status()
-        xml_content = clean_tally_xml(response.text)
-        data = xmltodict.parse(xml_content)
-        
-        collection = data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
-        ledgers = collection.get("LEDGER", [])
-        if isinstance(ledgers, dict):
-            ledgers = [ledgers]
-            
-        tax_names = set()
-        for l in ledgers:
-            name = get_text(l.get("@NAME"))
-            if name:
-                tax_names.add(name.strip().lower())
-        return tax_names
+        return gst_names_xml(decode_response(response))
     except Exception as e:
+        # Returning an empty set here would silently zero the GST on every
+        # invoice in this cycle, so the failure has to stop the module.
         logging.error(f"Failed to fetch tax ledgers: {e}")
-        return set()
+        raise
 
 
 def get_tax_amount(voucher, tax_ledger_names):
-
-    entries = voucher.get("LEDGERENTRIES.LIST") or []
-
-    if isinstance(entries, dict):
-        entries = [entries]
-
-    tax = 0.0
-
-    for entry in entries:
-
-        if not isinstance(entry, dict):
-            continue
-
-        ledger_name = get_text(
-            entry.get("LEDGERNAME")
-        ).strip().lower()
-
-        if ledger_name in tax_ledger_names:
-            tax += abs(safe_float(entry.get("AMOUNT")))
-
-    return round(tax, 2)
+    return invoice_tax(voucher, tax_ledger_names, purchase=True)
 
 
 # =====================================================
@@ -279,7 +225,7 @@ def get_purchase_bills(company_name: str = None):
     date_ranges = get_current_fy_monthly_date_ranges()
 
     # Fetch max alter_id from local SQLite
-    max_alter_id = get_max_alter_id_local("purchase_invoices", company_name)
+    max_alter_id = reconcile_from_id(get_max_alter_id_local("purchase_invoices", company_name))
     _last_start_alter_ids[company_name] = max_alter_id
     logging.info(f"Purchase incremental sync from alter_id > {max_alter_id}")
     
@@ -323,10 +269,13 @@ def get_purchase_bills(company_name: str = None):
                             VOUCHERNUMBER,
                             VOUCHERTYPENAME,
                             PARTYNAME,
+                            PARTYLEDGERNAME,
                             AMOUNT,
                             NARRATION,
                             REFERENCE,
                             REFERENCEDATE,
+                            LEDGERENTRIES.LIST,
+                            ALLLEDGERENTRIES.LIST,
                             ISDELETED,
                             ISCANCELLED,
                             ALTERID
@@ -352,7 +301,7 @@ def get_purchase_bills(company_name: str = None):
             )
             response.raise_for_status()
             
-            xml_content = clean_tally_xml(response.text)
+            xml_content = clean_tally_xml(decode_response(response))
             data = xmltodict.parse(xml_content)
             
             collection = (
@@ -388,7 +337,7 @@ def get_purchase_bills(company_name: str = None):
                 if not date:
                     continue
 
-                supplier_name = get_text(voucher.get("PARTYNAME"))
+                supplier_name = get_text(voucher.get("PARTYLEDGERNAME")) or get_text(voucher.get("PARTYNAME"))
                 supplier_key = supplier_name.strip().lower()
                 supplier_info = supplier_map.get(supplier_key, {})
                 supplier_id = supplier_info.get("id")
@@ -440,7 +389,7 @@ def get_purchase_bills(company_name: str = None):
         except Exception as e:
             logging.info(f"Chunk Error ({start_date}-{end_date}): {e}")
             
-        # Breathing gap — gives Tally's event loop time to flush memory between chunks
+        # Breathing gap â€” gives Tally's event loop time to flush memory between chunks
         time.sleep(0.5)
 
     # Deduplicate by GUID to prevent batch upsert conflicts
@@ -523,7 +472,7 @@ def reconcile_deleted_purchase_bills(company_name: str) -> int:
             timeout=120
         )
         response.raise_for_status()
-        xml_content = clean_tally_xml(response.text)
+        xml_content = clean_tally_xml(decode_response(response))
         data = xmltodict.parse(xml_content)
         collection = (
             data.get("ENVELOPE", {})
@@ -550,7 +499,7 @@ def reconcile_deleted_purchase_bills(company_name: str) -> int:
         return 0
 
     if not tally_active_guids:
-        logging.warning("Reconcile: Tally returned 0 active Purchase GUIDs — skipping deletion to prevent data wipe.")
+        logging.warning("Reconcile: Tally returned 0 active Purchase GUIDs â€” skipping deletion to prevent data wipe.")
         return 0
 
     from .local_db import reconcile_local_deletions
