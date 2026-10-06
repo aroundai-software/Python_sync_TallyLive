@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+
+build/
+dist/
+dist_deployment/
+dist_deployment.zip
+
+data/
+scratch/
+resync-*/
+
+.env
+*.log
+payment_perf.xml

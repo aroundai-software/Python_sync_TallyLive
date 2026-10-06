@@ -1,0 +1,10 @@
+requests
+supabase
+python-dotenv
+xmltodict
+fastapi
+uvicorn
+
+
+
+python-dateutil  
