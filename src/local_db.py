@@ -734,7 +734,7 @@ def _coerce_record_types(rec: dict, table_name: str) -> dict:
     for k, v in rec.items():
         if k in int_fields:
             try:
-                coerced[k] = int(float(v)) if v is not None else None
+                coerced[k] = int(round(float(v))) if v is not None else None
             except (TypeError, ValueError):
                 coerced[k] = None
         elif k in text_fields:
@@ -748,7 +748,164 @@ def _coerce_record_types(rec: dict, table_name: str) -> dict:
 # CLOUD UPLOAD ENGINE (PHASE 3: SQLite -> Supabase)
 # =========================================================================
 
-def push_local_table_to_supabase(table_name: str, supabase, company_name: str = None, batch_size: int = 500) -> int:
+def _load_parent_uuid_map(supabase, parent_table: str, company_name: str = None) -> dict:
+    """Fetch {tally_guid: supabase_uuid} for sales_invoices or purchase_invoices."""
+    parent_guid_to_uuid = {}
+    try:
+        offset = 0
+        while True:
+            q = supabase.table(parent_table).select("id, guid")
+            if company_name:
+                q = q.eq("company_name", company_name)
+            res = q.range(offset, offset + 999).execute()
+            rows = res.data or []
+            for r in rows:
+                if r.get("guid") and r.get("id"):
+                    parent_guid_to_uuid[r["guid"]] = r["id"]
+            if len(rows) < 1000:
+                break
+            offset += 1000
+    except Exception as e:
+        logging.warning(
+            f"[LocalDB->Supabase] Could not fetch {parent_table} UUID map: {e}"
+        )
+    return parent_guid_to_uuid
+
+
+def _item_parent_voucher_guid(rec: dict, item_guid: str, id_field: str) -> str:
+    """Best-effort Tally voucher GUID for a line item row."""
+    if rec.get("voucher_guid"):
+        return str(rec["voucher_guid"])
+    curr = rec.get(id_field)
+    g = str(item_guid or "")
+    # Item guids are written as "{voucher_guid}-{line_idx}"
+    if "-" in g:
+        return g.rsplit("-", 1)[0]
+    return str(curr) if curr else g
+
+
+def _resolve_parent_uuid(rec: dict, item_guid: str, id_field: str, parent_map: dict):
+    """
+    Return Supabase parent UUID, or None if not in map.
+    Always prefers map lookup — Tally GUIDs can look like UUIDs.
+    """
+    curr = rec.get(id_field)
+    v_guid = _item_parent_voucher_guid(rec, item_guid, id_field)
+    mapped = parent_map.get(v_guid) or (parent_map.get(str(curr)) if curr else None)
+    if mapped:
+        return mapped
+    # Already a real cloud UUID from a previous resolve / cloud-linked stage
+    if curr and is_valid_uuid(curr) and curr in parent_map.values():
+        return str(curr)
+    return None
+
+
+def _local_parent_rows_by_guids(
+    parent_table: str, company_name: str, guids: list
+) -> list:
+    """Load parent invoice rows from SQLite by guid (any sync status)."""
+    if not guids or not company_name:
+        return []
+    parent_table = TABLE_MAP.get(parent_table, parent_table)
+    conn = get_connection()
+    out = []
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (parent_table,),
+        )
+        if not cur.fetchone():
+            return []
+        for i in range(0, len(guids), 400):
+            chunk = [str(g) for g in guids[i : i + 400] if g]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f'SELECT * FROM "{parent_table}" '
+                f'WHERE {_exact_company_clause()} AND guid IN ({placeholders})',
+                [company_name] + chunk,
+            ).fetchall()
+            for row in rows:
+                d = dict(row)
+                for col in list(INTERNAL_COLS):
+                    d.pop(col, None)
+                if d.get("guid"):
+                    out.append(d)
+    except Exception as e:
+        logging.warning(f"[LocalDB] Could not load local {parent_table} parents: {e}")
+    finally:
+        conn.close()
+    return out
+
+
+def _ensure_parents_in_supabase(
+    supabase,
+    parent_table: str,
+    company_name: str,
+    missing_guids: list,
+    parent_map: dict,
+) -> tuple:
+    """
+    Upsert missing parent invoices from local SQLite into Supabase, then refresh map.
+    Returns (updated_map, error_or_None).
+    """
+    missing = sorted({str(g) for g in missing_guids if g and str(g) not in parent_map})
+    if not missing:
+        return parent_map, None
+
+    local_rows = _local_parent_rows_by_guids(parent_table, company_name, missing)
+    if not local_rows:
+        logging.warning(
+            f"[LocalDB->Supabase] {len(missing)} parent guid(s) missing in Supabase "
+            f"and not found in local {parent_table} (sample: {missing[:3]})"
+        )
+        return parent_map, None
+
+    upload_batch = []
+    valid_guids = []
+    for rec in local_rows:
+        row = dict(rec)
+        if parent_table == "sales_invoices":
+            if not is_valid_uuid(row.get("customer_id")):
+                row["customer_id"] = None
+        elif parent_table == "purchase_invoices":
+            row.pop("customer_id", None)
+            if not is_valid_uuid(row.get("supplier_id")):
+                row["supplier_id"] = None
+        row["company_name"] = company_name
+        upload_batch.append(_coerce_record_types(row, parent_table))
+        valid_guids.append(row["guid"])
+
+    logging.info(
+        f"[LocalDB->Supabase] Ensuring {len(upload_batch)} missing {parent_table} "
+        f"parent(s) exist in Supabase before line items..."
+    )
+    try:
+        for i in range(0, len(upload_batch), 500):
+            chunk = upload_batch[i : i + 500]
+            chunk_guids = valid_guids[i : i + 500]
+            supabase.table(parent_table).upsert(
+                chunk, on_conflict=COMPOSITE_CONFLICT
+            ).execute()
+            mark_records_synced(parent_table, chunk_guids, company_name=company_name)
+    except Exception as e:
+        from .error_format import format_error
+        err = f"{parent_table}: {format_error(e)}"
+        logging.warning(f"[LocalDB->Supabase] Failed ensuring parents: {err}")
+        return parent_map, err
+
+    refreshed = _load_parent_uuid_map(supabase, parent_table, company_name)
+    logging.info(
+        f"[LocalDB->Supabase] Parent map for {parent_table}: "
+        f"{len(parent_map)} -> {len(refreshed)} UUID(s)"
+    )
+    return refreshed, None
+
+
+def push_local_table_to_supabase(
+    table_name: str, supabase, company_name: str = None, batch_size: int = None
+) -> tuple:
     """
     Pushes all pending records from a dedicated SQLite table to Supabase.
     - Resolves relational IDs (UUIDs) for child line items automatically.
@@ -757,7 +914,48 @@ def push_local_table_to_supabase(table_name: str, supabase, company_name: str = 
     - Guarantees zero data loss: failed records stay 'pending' for next retry.
     """
     supabase_table = TABLE_MAP.get(table_name, table_name)
+    # Daybook rows are wide/heavy for Postgres upserts - keep batches small.
+    if batch_size is None:
+        batch_size = 100 if supabase_table == "tally_daybook" else 500
     total_synced = 0
+    last_error = None
+
+    # Re-queue rows that should retry (orphan parents / statement timeouts)
+    try:
+        _conn = get_connection()
+        with _conn:
+            if supabase_table in ("invoice_items", "invoice_items_purchase"):
+                if company_name:
+                    _conn.execute(
+                        f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                        f'WHERE {_exact_company_clause()} AND _sync_status = "failed" '
+                        f'AND _sync_error LIKE ?',
+                        (company_name, "%Parent invoice UUID not found%"),
+                    )
+                else:
+                    _conn.execute(
+                        f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                        f'WHERE _sync_status = "failed" AND _sync_error LIKE ?',
+                        ("%Parent invoice UUID not found%",),
+                    )
+            if supabase_table == "tally_daybook":
+                if company_name:
+                    _conn.execute(
+                        f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                        f'WHERE {_exact_company_clause()} AND _sync_status = "failed" '
+                        f'AND (_sync_error LIKE ? OR _sync_error LIKE ?)',
+                        (company_name, "%57014%", "%statement timeout%"),
+                    )
+                else:
+                    _conn.execute(
+                        f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                        f'WHERE _sync_status = "failed" '
+                        f'AND (_sync_error LIKE ? OR _sync_error LIKE ?)',
+                        ("%57014%", "%statement timeout%"),
+                    )
+        _conn.close()
+    except Exception as repend_err:
+        logging.warning(f"[LocalDB] Could not re-pend retryable {supabase_table}: {repend_err}")
 
     # 1. Process pending deletions for this table
     conn = get_connection()
@@ -835,41 +1033,25 @@ def push_local_table_to_supabase(table_name: str, supabase, company_name: str = 
 
     # 3. Pre-fetch parent UUID maps if uploading line items
     parent_guid_to_uuid = {}
+    parent_table_for_items = None
     if supabase_table == "invoice_items":
-        try:
-            offset = 0
-            while True:
-                q = supabase.table("sales_invoices").select("id, guid")
-                if company_name:
-                    q = q.eq("company_name", company_name)
-                res = q.range(offset, offset + 999).execute()
-                rows = res.data or []
-                for r in rows:
-                    if r.get("guid") and r.get("id"):
-                        parent_guid_to_uuid[r["guid"]] = r["id"]
-                if len(rows) < 1000:
-                    break
-                offset += 1000
-        except Exception as e:
-            logging.warning(f"[LocalDB->Supabase] Could not fetch sales_invoices UUID map: {e}")
-
+        parent_table_for_items = "sales_invoices"
+        parent_guid_to_uuid = _load_parent_uuid_map(
+            supabase, parent_table_for_items, company_name
+        )
+        logging.info(
+            f"[LocalDB->Supabase] Loaded {len(parent_guid_to_uuid)} sales_invoices "
+            f"UUID(s) for line-item link"
+        )
     elif supabase_table == "invoice_items_purchase":
-        try:
-            offset = 0
-            while True:
-                q = supabase.table("purchase_invoices").select("id, guid")
-                if company_name:
-                    q = q.eq("company_name", company_name)
-                res = q.range(offset, offset + 999).execute()
-                rows = res.data or []
-                for r in rows:
-                    if r.get("guid") and r.get("id"):
-                        parent_guid_to_uuid[r["guid"]] = r["id"]
-                if len(rows) < 1000:
-                    break
-                offset += 1000
-        except Exception as e:
-            logging.warning(f"[LocalDB->Supabase] Could not fetch purchase_invoices UUID map: {e}")
+        parent_table_for_items = "purchase_invoices"
+        parent_guid_to_uuid = _load_parent_uuid_map(
+            supabase, parent_table_for_items, company_name
+        )
+        logging.info(
+            f"[LocalDB->Supabase] Loaded {len(parent_guid_to_uuid)} purchase_invoices "
+            f"UUID(s) for line-item link"
+        )
 
     # 4. Upload pending records in batches
     while True:
@@ -877,69 +1059,97 @@ def push_local_table_to_supabase(table_name: str, supabase, company_name: str = 
         if not records:
             break
 
-        # Sanitize/resolve columns for Supabase schema
-        upload_batch = []
-        valid_guids = []
-        for r, g in zip(records, guids):
-            rec = dict(r)
+        def _build_item_batch(recs, gs, parent_map):
+            upload_batch = []
+            valid_guids = []
+            missing_parent_guids = []
+            for r, g in zip(recs, gs):
+                rec = dict(r)
 
-            if supabase_table == "sales_invoices":
-                # customer_id must be a valid UUID or None
-                if not is_valid_uuid(rec.get("customer_id")):
-                    rec["customer_id"] = None
+                if supabase_table == "sales_invoices":
+                    if not is_valid_uuid(rec.get("customer_id")):
+                        rec["customer_id"] = None
 
-            elif supabase_table == "purchase_invoices":
-                # purchase_invoices uses supplier_id, NOT customer_id
-                rec.pop("customer_id", None)
-                if not is_valid_uuid(rec.get("supplier_id")):
-                    rec["supplier_id"] = None
+                elif supabase_table == "purchase_invoices":
+                    rec.pop("customer_id", None)
+                    if not is_valid_uuid(rec.get("supplier_id")):
+                        rec["supplier_id"] = None
 
-            elif supabase_table == "invoice_items":
-                # Link invoice_id to parent UUID
-                curr_inv_id = rec.get("invoice_id")
-                if not is_valid_uuid(curr_inv_id):
-                    # Lookup via parent map (guid format is usually voucher_guid-item_idx)
-                    v_guid = rec.get("voucher_guid") or (str(g).rsplit("-", 1)[0] if "-" in str(g) else str(g))
-                    mapped_uuid = parent_guid_to_uuid.get(v_guid) or parent_guid_to_uuid.get(curr_inv_id)
-                    if mapped_uuid:
-                        rec["invoice_id"] = mapped_uuid
-                    else:
-                        # Cannot upload line item without parent UUID
+                elif supabase_table == "invoice_items":
+                    mapped_uuid = _resolve_parent_uuid(
+                        rec, g, "invoice_id", parent_map
+                    )
+                    if not mapped_uuid:
+                        missing_parent_guids.append(
+                            _item_parent_voucher_guid(rec, g, "invoice_id")
+                        )
                         continue
-                rec.pop("voucher_guid", None)
+                    rec["invoice_id"] = mapped_uuid
+                    rec.pop("voucher_guid", None)
 
-            elif supabase_table == "invoice_items_purchase":
-                # Ensure purchase_invoice_id is used and is a valid UUID
-                curr_pur_id = rec.get("purchase_invoice_id") or rec.get("invoice_id")
-                rec.pop("invoice_id", None)
-                if not is_valid_uuid(curr_pur_id):
-                    v_guid = rec.get("voucher_guid") or (str(g).rsplit("-", 1)[0] if "-" in str(g) else str(g))
-                    mapped_uuid = parent_guid_to_uuid.get(v_guid) or parent_guid_to_uuid.get(curr_pur_id)
-                    if mapped_uuid:
-                        rec["purchase_invoice_id"] = mapped_uuid
-                    else:
+                elif supabase_table == "invoice_items_purchase":
+                    if not rec.get("purchase_invoice_id") and rec.get("invoice_id"):
+                        rec["purchase_invoice_id"] = rec.get("invoice_id")
+                    rec.pop("invoice_id", None)
+                    mapped_uuid = _resolve_parent_uuid(
+                        rec, g, "purchase_invoice_id", parent_map
+                    )
+                    if not mapped_uuid:
+                        missing_parent_guids.append(
+                            _item_parent_voucher_guid(rec, g, "purchase_invoice_id")
+                        )
                         continue
-                else:
-                    rec["purchase_invoice_id"] = curr_pur_id
-                rec.pop("voucher_guid", None)
+                    rec["purchase_invoice_id"] = mapped_uuid
+                    rec.pop("voucher_guid", None)
 
-            # Enforce company stamp before upload
-            if company_name:
-                rec["company_name"] = company_name
-            if not (rec.get("company_name") or "").strip() and supabase_table != "tally_companies":
-                continue
-            if supabase_table == "tally_companies" and not (rec.get("company_name") or "").strip():
-                continue
+                if company_name:
+                    rec["company_name"] = company_name
+                if not (rec.get("company_name") or "").strip() and supabase_table != "tally_companies":
+                    continue
+                if supabase_table == "tally_companies" and not (rec.get("company_name") or "").strip():
+                    continue
 
-            upload_batch.append(_coerce_record_types(rec, supabase_table))
-            valid_guids.append(g)
+                upload_batch.append(_coerce_record_types(rec, supabase_table))
+                valid_guids.append(g)
+            return upload_batch, valid_guids, missing_parent_guids
+
+        upload_batch, valid_guids, missing_parents = _build_item_batch(
+            records, guids, parent_guid_to_uuid
+        )
+
+        # If line items lack parents in cloud, push those parents from local SQLite then retry
+        if (
+            parent_table_for_items
+            and missing_parents
+            and len(upload_batch) < len(records)
+        ):
+            parent_guid_to_uuid, ensure_err = _ensure_parents_in_supabase(
+                supabase,
+                parent_table_for_items,
+                company_name,
+                missing_parents,
+                parent_guid_to_uuid,
+            )
+            if ensure_err:
+                last_error = ensure_err
+            upload_batch, valid_guids, missing_parents = _build_item_batch(
+                records, guids, parent_guid_to_uuid
+            )
 
         if not upload_batch:
-            # Mark any orphaned items that couldn't be resolved
-            mark_records_failed(
-                supabase_table, guids, "Parent invoice UUID not found in Supabase",
-                company_name=company_name,
-            )
+            if parent_table_for_items:
+                msg = (
+                    f"{len(guids)} {supabase_table} row(s) waiting for parent invoice "
+                    f"UUID in Supabase (map_size={len(parent_guid_to_uuid)}, "
+                    f"missing_sample={missing_parents[:3]!r}; will retry next cycle)"
+                )
+                logging.warning(f"[LocalDB->Supabase] {msg}")
+                last_error = f"{supabase_table}: Parent invoice UUID not found in Supabase"
+            else:
+                logging.warning(
+                    f"[LocalDB->Supabase] No uploadable rows in pending batch for {supabase_table}"
+                )
+                last_error = f"{supabase_table}: no uploadable rows in pending batch"
             break
 
         conflict_target = (
@@ -956,7 +1166,9 @@ def push_local_table_to_supabase(table_name: str, supabase, company_name: str = 
             total_synced += len(upload_batch)
             logging.info(f"[LocalDB->Supabase] Synced {total_synced} {supabase_table} to Supabase...")
         except Exception as e:
-            err_str = str(e)
+            from .error_format import format_error
+            err_str = format_error(e)
+            last_error = f"{supabase_table}: {err_str}"
             logging.warning(f"[LocalDB->Supabase] Batch upload error for {supabase_table}: {err_str}")
             # Graceful fallback for outstanding receivables/payables if columns missing in Supabase
             if any(k in err_str for k in ("group_name", "mobile", "PGRST204")):
@@ -970,36 +1182,134 @@ def push_local_table_to_supabase(table_name: str, supabase, company_name: str = 
                     ).execute()
                     mark_records_synced(supabase_table, valid_guids, company_name=company_name)
                     total_synced += len(upload_batch)
+                    last_error = None
                     continue
                 except Exception as inner_e:
+                    last_error = f"{supabase_table}: {format_error(inner_e)}"
                     mark_records_failed(
-                        supabase_table, valid_guids, str(inner_e), company_name=company_name
+                        supabase_table, valid_guids, last_error, company_name=company_name
                     )
                     break
+            elif "57014" in err_str or "statement timeout" in err_str.lower():
+                # Leave pending and retry in smaller pieces (do not mark failed).
+                if len(upload_batch) > 25:
+                    mini = max(25, len(upload_batch) // 4)
+                    logging.warning(
+                        f"[LocalDB->Supabase] Retrying {supabase_table} in chunks of {mini} "
+                        f"after statement timeout..."
+                    )
+                    timed_out = False
+                    for i in range(0, len(upload_batch), mini):
+                        sub = upload_batch[i : i + mini]
+                        sub_guids = valid_guids[i : i + mini]
+                        try:
+                            supabase.table(supabase_table).upsert(
+                                sub, on_conflict=conflict_target
+                            ).execute()
+                            mark_records_synced(
+                                supabase_table, sub_guids, company_name=company_name
+                            )
+                            total_synced += len(sub)
+                            logging.info(
+                                f"[LocalDB->Supabase] Synced {total_synced} {supabase_table} "
+                                f"to Supabase..."
+                            )
+                            last_error = None
+                        except Exception as mini_e:
+                            last_error = f"{supabase_table}: {format_error(mini_e)}"
+                            logging.warning(
+                                f"[LocalDB->Supabase] Mini-batch error for {supabase_table}: "
+                                f"{last_error}"
+                            )
+                            timed_out = True
+                            break
+                    if timed_out:
+                        break
+                    continue
+                logging.warning(
+                    f"[LocalDB->Supabase] Leaving {len(valid_guids)} {supabase_table} "
+                    f"row(s) pending after statement timeout (will retry next cycle)"
+                )
+                break
             else:
                 mark_records_failed(
                     supabase_table, valid_guids, err_str, company_name=company_name
                 )
                 break
 
-    return total_synced
+    return total_synced, last_error
 
 
-def push_all_pending_to_supabase(supabase, company_name: str = None) -> dict:
+def push_all_pending_to_supabase(supabase, company_name: str = None) -> tuple:
     """
     Pushes all pending records across all 13 dedicated tables to Supabase.
     Follows proper relational dependency order (companies -> masters -> vouchers -> items).
-    Returns a dictionary of {table_name: synced_count}.
+    Returns (results_dict, errors_list).
     """
     results = {}
+    errors = []
     for table_name in ALL_TABLES:
         try:
-            count = push_local_table_to_supabase(table_name, supabase, company_name=company_name)
+            count, err = push_local_table_to_supabase(
+                table_name, supabase, company_name=company_name
+            )
             results[table_name] = count
+            if err:
+                errors.append(err)
         except Exception as e:
+            from .error_format import format_error
+            msg = f"{table_name}: {format_error(e)}"
             logging.error(f"[CloudSync] Error syncing {table_name} to Supabase: {e}")
             results[table_name] = 0
-    return results
+            errors.append(msg)
+    # Surface a sample of row-level failures still marked failed in SQLite
+    try:
+        errors.extend(get_recent_upload_errors(company_name=company_name, limit=5))
+    except Exception:
+        pass
+    return results, errors
+
+
+def get_recent_upload_errors(company_name: str = None, limit: int = 5) -> list:
+    """Read recent _sync_error values from local tables for sync_logs."""
+    conn = get_connection()
+    out = []
+    try:
+        for table_name in ALL_TABLES:
+            supabase_table = TABLE_MAP.get(table_name, table_name)
+            try:
+                cols = {
+                    r["name"]
+                    for r in conn.execute(f'PRAGMA table_info("{supabase_table}")').fetchall()
+                }
+            except Exception:
+                continue
+            if "_sync_error" not in cols:
+                continue
+            if company_name and "company_name" in cols:
+                rows = conn.execute(
+                    f'SELECT _sync_error FROM "{supabase_table}" '
+                    f'WHERE _sync_status = ? AND company_name = ? AND _sync_error IS NOT NULL '
+                    f'LIMIT ?',
+                    ("failed", company_name, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f'SELECT _sync_error FROM "{supabase_table}" '
+                    f'WHERE _sync_status = ? AND _sync_error IS NOT NULL LIMIT ?',
+                    ("failed", limit),
+                ).fetchall()
+            for row in rows:
+                err = (row["_sync_error"] or "").strip()
+                if err:
+                    line = f"{supabase_table} row failed: {err}"
+                    if line not in out:
+                        out.append(line)
+            if len(out) >= limit:
+                break
+    finally:
+        conn.close()
+    return out[:limit]
 
 
 def get_table_counts(company_name: str = None) -> dict:

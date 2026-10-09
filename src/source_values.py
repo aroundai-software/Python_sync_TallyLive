@@ -8,31 +8,65 @@ def text(value):
     if isinstance(value,dict):return text(value.get('#text',''))
     return str(value or '').strip()
 
+_FOREIGN_CURRENCY_RE=re.compile(
+    r'\b(?:USD|AED|BD|BHD|SAR|EUR|GBP|ZAR|BWP|QAR|OMR|KWD|CHF|JPY|CNY|SGD|AUD|CAD|NZD)\b',
+    re.I,
+)
+_FOREIGN_CURRENCY_SYMBOLS=('$','€','£','\u20c1','\u20c3')
+_NUMBER_RE=re.compile(
+    r'\s*([+-]?)\s*(?:₹|INR\s*|Rs\.?\s*)?\s*([+-]?\d+(?:\.\d+)?)',
+    re.I,
+)
+_LOOSE_NUMBER_RE=re.compile(r'([+-]?)\s*(\d+(?:\.\d+)?)')
+
+def _has_foreign_currency(raw):
+    return any(symbol in raw for symbol in _FOREIGN_CURRENCY_SYMBOLS) or bool(_FOREIGN_CURRENCY_RE.search(raw))
+
+def _has_inr_denomination(raw):
+    return '₹' in raw or bool(re.search(r'\bINR\b|\bRs\.?',raw,re.I))
+
+def _finalize_number(raw, sign_prefix, digits):
+    number=Decimal(digits)
+    if sign_prefix=='-':number=-abs(number)
+    low=raw.lower()
+    if low.endswith(' dr') or low.rstrip().endswith('dr'):number=-abs(number)
+    elif low.endswith(' cr') or low.rstrip().endswith('cr'):number=abs(number)
+    return float(number)
+
 def source_number(value, default=0):
     raw=text(value).replace(',','').strip()
     if not raw:return default
-    # Tally supplies the exact converted base value after '='. Never treat
-    # the foreign amount or its exchange rate as an INR amount.
+    # Tally uses '=' for forex ("$10 = ₹830" or "$10 = 830") and stock units
+    # ("10 Nos = 100.5 kg"). Prefer the value after '='.
     if '=' in raw:
-        raw=raw.rsplit('=',1)[1].strip()
-        if not ('₹' in raw or re.search(r'\bINR\b|\bRs\.?',raw)):
-            raise ValueError('Converted value is not explicitly denominated in INR')
-    elif any(symbol in raw for symbol in ('$','€','£','\u20c1','\u20c3')) or re.search(r'\b(?:USD|AED|BD|BHD|SAR|EUR|GBP)\b',raw):
+        left,right=raw.rsplit('=',1)
+        right=right.strip()
+        # Many multi-currency companies omit ₹/INR on the converted side.
+        # If the right side still has a parseable number, accept it.
+        if (_has_foreign_currency(left) or _has_foreign_currency(right)) and not _has_inr_denomination(right):
+            if not _LOOSE_NUMBER_RE.search(right):
+                raise ValueError('Converted value is not explicitly denominated in INR')
+        raw=right
+    elif _has_foreign_currency(raw):
         raise ValueError('Foreign amount has no native INR conversion')
-    match=re.match(r'\s*([+-]?)\s*(?:₹|INR\s*|Rs\.?\s*)?\s*([+-]?\d+(?:\.\d+)?)',raw)
-    if not match:raise ValueError('Invalid Tally numeric value')
-    number=Decimal(match[2])
-    if match[1]=='-':number=-abs(number)
-    if raw.lower().endswith(' dr'):number=-abs(number)
-    elif raw.lower().endswith(' cr'):number=abs(number)
-    return float(number)
+    match=_NUMBER_RE.match(raw)
+    if match:
+        return _finalize_number(raw, match[1], match[2])
+    loose=_LOOSE_NUMBER_RE.search(raw)
+    if loose:
+        return _finalize_number(raw, loose[1], loose[2])
+    raise ValueError('Invalid Tally numeric value')
 
 def decode_response(response):
     raw=response.content
     if raw.startswith((b'\xff\xfe',b'\xfe\xff')):return raw.decode('utf-16')
     if raw[:2]==b'<\x00':return raw.decode('utf-16-le')
     if raw[:2]==b'\x00<':return raw.decode('utf-16-be')
-    return raw.decode('utf-8-sig')
+    # Indian Windows Tally often emits 0xA0 (NBSP) in UTF-8 exports.
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode('cp1252')
 
 def clean_source_xml(raw):
     def reference(match):
@@ -100,12 +134,36 @@ def paged_rows(client,table,columns,company):
 def reconcile_from_id(value):
     return 0 if os.environ.get('FULL_RECONCILE','').lower() in ('1','true','yes') else value
 
-# Used only when Tally's export omits the base currency. Tally's own value
-# always wins, so this is not the blanket override the old AED constant was.
+# Used only when Tally's export omits the base currency entirely. Tally's own
+# value always wins, so this is not the blanket override the old AED constant was.
 DEFAULT_BASE_CURRENCY='INR'
 
+# Tally reports the base currency as a symbol, and only over a UTF-16 request;
+# a UTF-8 request flattens every symbol to '?'. The Currency collection's
+# mailing name is the reliable source, so both spellings are mapped here.
+CURRENCY_NAMES={
+ '₹':'INR','\u20b9':'INR','Rs':'INR','Rs.':'INR','INR':'INR','RUPEES':'INR','INDIAN RUPEES':'INR',
+ '\u20c3':'AED','AED':'AED','DHS':'AED','DH':'AED','UAE DIRHAM':'AED','DIRHAM':'AED','DIRHAMS':'AED',
+ '$':'USD','USD':'USD','US DOLLAR':'USD','€':'EUR','EUR':'EUR','EURO':'EUR',
+ '£':'GBP','GBP':'GBP','POUND':'GBP','POUND STERLING':'GBP',
+ 'SAR':'SAR','SAUDI RIYAL':'SAR','BHD':'BHD','BAHRAINI DINAR':'BHD',
+ 'OMR':'OMR','QAR':'QAR','KWD':'KWD',
+}
+
+def currency_code(raw):
+    """Map a Tally currency symbol or name onto an ISO code, or None."""
+    raw=text(raw)
+    return CURRENCY_NAMES.get(raw) or CURRENCY_NAMES.get(raw.upper())
+
 def company_currency(company):
-    raw=text(company.get('BASECURRENCYNAME') or company.get('CURRENCYNAME') or os.environ.get('TALLY_BASE_CURRENCY') or DEFAULT_BASE_CURRENCY)
-    mapping={'₹':'INR','Rs':'INR','Rs.':'INR','INR':'INR','AED':'AED','Dhs':'AED','USD':'USD','$':'USD','EUR':'EUR','€':'EUR','GBP':'GBP','£':'GBP'}
-    if raw not in mapping:raise ValueError('Native company base currency is unavailable or unsupported')
-    return mapping[raw]
+    for key in ('BASECURRENCYMAILINGNAME','BASECURRENCYNAME','CURRENCYNAME'):
+        code=currency_code(company.get(key))
+        if code:return code
+    # A '?' here means the request went out as UTF-8 and Tally could not encode
+    # the symbol; fall back rather than mislabel, but never silently guess a
+    # currency when Tally gave us a real value we simply do not recognise.
+    for key in ('BASECURRENCYMAILINGNAME','BASECURRENCYNAME','CURRENCYNAME'):
+        raw=text(company.get(key))
+        if raw and raw!='?':raise ValueError(f'Unsupported Tally base currency {raw!r}')
+    code=currency_code(os.environ.get('TALLY_BASE_CURRENCY')) or currency_code(DEFAULT_BASE_CURRENCY)
+    return code

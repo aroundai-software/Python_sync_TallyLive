@@ -116,7 +116,7 @@ def fetch_lpp_for_ledger(tally_url: str, company_name: str, ledger_name: str) ->
         tally_url,
         data=xml_req.encode("utf-8"),
         headers={"Content-Type": "application/xml", "Connection": "close"},
-        timeout=15
+        timeout=45
     )
     resp.raise_for_status()
     body = decode_response(resp)
@@ -237,10 +237,10 @@ def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int)
                             ISDELETED,
                             ISCANCELLED
                         </FETCH>
-                        <FILTER>DateFilter</FILTER>
+                        <FILTER>PaymentTypeFilter</FILTER>
                         {alter_filter}
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="DateFilter">$Date &gt;= $$Date:"{c_start}" AND $Date &lt;= $$Date:"{c_end}" AND ($$IsReceipt:$VoucherTypeName OR $$IsPayment:$VoucherTypeName)</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="PaymentTypeFilter">$$IsReceipt:$VoucherTypeName OR $$IsPayment:$VoucherTypeName</SYSTEM>
                     {alter_formula}
                 </TDLMESSAGE>
             </TDL>

@@ -284,10 +284,10 @@ def get_sale_bills(company_name: str = None):
                             ISCANCELLED,
                             ALTERID
                         </FETCH>
-                        <FILTER>DateFilter</FILTER>
+                        <FILTER>SalesTypeFilter</FILTER>
                         {alter_filter_tag}
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="DateFilter">$Date &gt;= $$Date:"{start_date}" AND $Date &lt;= $$Date:"{end_date}" AND $$IsSales:$VoucherTypeName</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="SalesTypeFilter">$$IsSales:$VoucherTypeName</SYSTEM>
                     {alter_formula_tag}
                 </TDLMESSAGE>
             </TDL>
@@ -323,64 +323,79 @@ def get_sale_bills(company_name: str = None):
                 continue
 
             cancelled_guids = []
+            skipped_vouchers = 0
             for voucher in vouchers:
-                if get_text(voucher.get("ISDELETED")) == "Yes" or get_text(voucher.get("ISCANCELLED")) == "Yes":
-                    v_guid = get_text(voucher.get("GUID"))
-                    if v_guid:
-                        cancelled_guids.append(v_guid)
-                    continue
+                try:
+                    if get_text(voucher.get("ISDELETED")) == "Yes" or get_text(voucher.get("ISCANCELLED")) == "Yes":
+                        v_guid = get_text(voucher.get("GUID"))
+                        if v_guid:
+                            cancelled_guids.append(v_guid)
+                        continue
 
-                order_number = get_text(voucher.get("VOUCHERNUMBER"))
-                if not order_number:
-                    continue
+                    order_number = get_text(voucher.get("VOUCHERNUMBER"))
+                    if not order_number:
+                        continue
 
-                guid = get_text(voucher.get("GUID"))
-                master_id = int(safe_float(voucher.get("MASTERID")))
-                date = format_tally_date(voucher.get("DATE"))
-                
-                if not date:
-                    continue
+                    guid = get_text(voucher.get("GUID"))
+                    master_id = int(safe_float(voucher.get("MASTERID")))
+                    date = format_tally_date(voucher.get("DATE"))
 
-                customer_name = get_text(voucher.get("PARTYLEDGERNAME")) or get_text(voucher.get("PARTYNAME"))
-                customer_key = customer_name.strip().lower()
-                customer_info = customer_map.get(customer_key, {})
-                customer_id = customer_info.get("id")
-                ledger_type = customer_info.get("ledger_type")
+                    if not date:
+                        continue
 
-                address = get_address(voucher) if 'get_address' in globals() else None
-                grand_total = abs(safe_float(voucher.get("AMOUNT")))
-                tax_total = get_tax_amount(voucher, tax_ledgers)
-                subtotal = round(grand_total - tax_total, 2)
+                    customer_name = get_text(voucher.get("PARTYLEDGERNAME")) or get_text(voucher.get("PARTYNAME"))
+                    customer_key = customer_name.strip().lower()
+                    customer_info = customer_map.get(customer_key, {})
+                    customer_id = customer_info.get("id")
+                    ledger_type = customer_info.get("ledger_type")
 
-                row = {
-                    "invoice_number": order_number,
-                    "invoice_date": date,
-                    "customer_name": customer_name,
-                    "customer_id": customer_id,
-                    "total_amount": round(grand_total, 2),
-                    "gst_amount": round(tax_total, 2),
-                    "net_amount": round(subtotal, 2),
-                    "discount_amount": 0,
-                    "discount_percentage": 0,
-                    "subtotal_before_discount": round(subtotal, 2),
-                    "status": "Pending",
-                    "Type": get_text(voucher.get("VOUCHERTYPENAME")),
-                    "notes": get_text_or_none(voucher.get("NARRATION")),
-                    "remarks": get_text_or_none(voucher.get("REFERENCE")),
-                    "shipping_address": address or None,
-                    "company_name": company_name,
-                    "ledger_type": ledger_type,
-                    "round_off": None,
-                    "synced_to_tally": True,
-                    "guid": guid,
-                    "master_id": str(master_id) if master_id else None,
-                    "alter_id": int(safe_float(voucher.get("ALTERID"), 0)),
-                    "updated_at": now,
-                }
+                    address = get_address(voucher) if 'get_address' in globals() else None
+                    grand_total = abs(safe_float(voucher.get("AMOUNT")))
+                    tax_total = get_tax_amount(voucher, tax_ledgers)
+                    subtotal = round(grand_total - tax_total, 2)
 
-                sale_bills_list.append(row)
-                chunk_bills.append(row)
-                
+                    row = {
+                        "invoice_number": order_number,
+                        "invoice_date": date,
+                        "customer_name": customer_name,
+                        "customer_id": customer_id,
+                        "total_amount": round(grand_total, 2),
+                        "gst_amount": round(tax_total, 2),
+                        "net_amount": round(subtotal, 2),
+                        "discount_amount": 0,
+                        "discount_percentage": 0,
+                        "subtotal_before_discount": round(subtotal, 2),
+                        # Provisional; corrected from outstanding by invoice_status before cloud push
+                        "status": "Pending",
+                        "Type": get_text(voucher.get("VOUCHERTYPENAME")),
+                        "notes": get_text_or_none(voucher.get("NARRATION")),
+                        "remarks": get_text_or_none(voucher.get("REFERENCE")),
+                        "shipping_address": address or None,
+                        "company_name": company_name,
+                        "ledger_type": ledger_type,
+                        "round_off": None,
+                        "synced_to_tally": True,
+                        "guid": guid,
+                        "master_id": str(master_id) if master_id else None,
+                        "alter_id": int(safe_float(voucher.get("ALTERID"), 0)),
+                        "updated_at": now,
+                    }
+
+                    sale_bills_list.append(row)
+                    chunk_bills.append(row)
+                except Exception as ve:
+                    skipped_vouchers += 1
+                    logging.error(
+                        f"Voucher Error Sale {get_text(voucher.get('VOUCHERNUMBER')) or '<no number>'} "
+                        f"({start_date}-{end_date}): {ve}"
+                    )
+
+            if skipped_vouchers:
+                logging.error(
+                    f"[{chunk_idx}/{total_chunks}] Skipped {skipped_vouchers} unparseable sale "
+                    f"vouchers in ({start_date}-{end_date})"
+                )
+
             if cancelled_guids:
                 from .local_db import stage_deletions
                 stage_deletions("sales_invoices", cancelled_guids, company_name)
@@ -395,7 +410,7 @@ def get_sale_bills(company_name: str = None):
         except Exception as e:
             logging.info(f"Chunk Error ({start_date}-{end_date}): {e}")
             
-        # Breathing gap â€” gives Tally's event loop time to flush memory between chunks
+        # Breathing gap - gives Tally's event loop time to flush memory between chunks
         time.sleep(0.5)
 
     # Deduplicate by GUID to prevent batch upsert conflicts
@@ -505,7 +520,7 @@ def reconcile_deleted_sale_bills(company_name: str) -> int:
         return 0
 
     if not tally_active_guids:
-        logging.warning("Reconcile: Tally returned 0 active Sales GUIDs â€” skipping deletion to prevent data wipe.")
+        logging.warning("Reconcile: Tally returned 0 active Sales GUIDs - skipping deletion to prevent data wipe.")
         return 0
 
     from .local_db import reconcile_local_deletions

@@ -50,15 +50,15 @@ def parse_float(value, default=0.0):
 
 def parse_qty(raw):
     """
-    Parse quantity from Tally format e.g. '5.00 Nos' â†’ 5.0.
-    Tally appends the unit name after a space â€” take only the numeric part.
+    Parse quantity from Tally formats like '5.00 Nos' or '10 Nos = 100.5 kg'.
+    Uses source_number so alternate-unit values after '=' are honoured.
     """
     if not raw:
         return 0.0
     text_val = get_text(raw)
     if not text_val:
         return 0.0
-    return parse_float(text_val.strip().split()[0])
+    return parse_float(text_val)
 
 
 def clean_tally_xml(xml_text):
@@ -179,14 +179,20 @@ def get_purchase_bill_items(company_name: str = None):
             guid_to_invoice_id = {}
     logging.info(f"Loaded {len(guid_to_invoice_id)} purchase_invoices for {company_name}")
 
-    from .date_utils import get_current_fy_item_date_ranges
-    date_ranges = get_current_fy_item_date_ranges(days_per_chunk=7)
+    # One FY window — inventory FETCH makes small date chunks unreliable in Tally.
+    from .date_utils import get_current_fy_monthly_date_ranges
+    _months = get_current_fy_monthly_date_ranges()
+    date_ranges = [(_months[0][0], _months[-1][1])] if _months else []
 
     # Determine checkpoint locally from SQLite
     max_alter_id = reconcile_from_id(get_max_alter_id_local("invoice_items_purchase", company_name))
     logging.info(f"Purchase items incremental sync from alter_id > {max_alter_id}")
     
-    logging.info(f"Fetching purchase bill items in {len(date_ranges)} chunks (7-day intervals)...")
+    logging.info(
+        f"Fetching purchase bill items for FY window "
+        f"{date_ranges[0][0]}-{date_ranges[0][1]}..."
+        if date_ranges else "Fetching purchase bill items (no FY window)..."
+    )
     
     items_list = []
     skipped_no_bill = 0
@@ -236,10 +242,10 @@ def get_purchase_bill_items(company_name: str = None):
                             INVENTORYENTRIES.RATEDETAILS.GSTRATE,
                             INVENTORYENTRIES.RATEDETAILS.GSTRATEDUTYHEAD
                         </FETCH>
-                        <FILTER>DateFilter</FILTER>
+                        <FILTER>PurchaseTypeFilter</FILTER>
                         {alter_filter_tag}
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="DateFilter">$Date &gt;= $$Date:"{start_date}" AND $Date &lt;= $$Date:"{end_date}" AND $$IsPurchase:$VoucherTypeName</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="PurchaseTypeFilter">$$IsPurchase:$VoucherTypeName</SYSTEM>
                     {alter_formula_tag}
                 </TDLMESSAGE>
             </TDL>
@@ -268,78 +274,84 @@ def get_purchase_bill_items(company_name: str = None):
                 continue
 
             for voucher in vouchers:
-                if get_text(voucher.get("ISDELETED")) == "Yes":
-                    continue
-                if get_text(voucher.get("ISCANCELLED")) == "Yes":
-                    continue
-
-                guid = get_text(voucher.get("GUID"))
-                if not guid:
-                    continue
-
-                purchase_invoice_id = guid_to_invoice_id.get(guid)
-                if not purchase_invoice_id:
-                    skipped_no_bill += 1
-                    continue
-
-                voucher_alter_id = 0
                 try:
-                    voucher_alter_id = int(get_text(voucher.get("ALTERID")) or 0)
-                except (ValueError, TypeError):
-                    voucher_alter_id = 0
-
-                entries = get_entries(voucher)
-                if not entries:
-                    skipped_no_items += 1
-                    continue
-
-                for idx, entry in enumerate(entries):
-                    item_name = get_text(entry.get("STOCKITEMNAME"))
-                    if not item_name:
+                    if get_text(voucher.get("ISDELETED")) == "Yes":
+                        continue
+                    if get_text(voucher.get("ISCANCELLED")) == "Yes":
                         continue
 
-                    quantity = resolve_quantity(entry)
-                    if not float(quantity).is_integer():
-                        raise ValueError("Fractional purchase quantity requires a numeric quantity column")
-                    unit_price = resolve_rate(entry)
-                    discount_pct, discount_amount = resolve_discount(entry)
+                    guid = get_text(voucher.get("GUID"))
+                    if not guid:
+                        continue
 
-                    if discount_pct and not discount_amount:
-                        discount_amount = round(quantity * unit_price * discount_pct / 100, 2)
+                    purchase_invoice_id = guid_to_invoice_id.get(guid)
+                    if not purchase_invoice_id:
+                        skipped_no_bill += 1
+                        continue
 
-                    subtotal = round(
-                        abs(source_number(entry.get("AMOUNT")))
-                        if get_text(entry.get("AMOUNT"))
-                        else (quantity * unit_price) - discount_amount,
-                        2,
+                    voucher_alter_id = 0
+                    try:
+                        voucher_alter_id = int(get_text(voucher.get("ALTERID")) or 0)
+                    except (ValueError, TypeError):
+                        voucher_alter_id = 0
+
+                    entries = get_entries(voucher)
+                    if not entries:
+                        skipped_no_items += 1
+                        continue
+
+                    for idx, entry in enumerate(entries):
+                        item_name = get_text(entry.get("STOCKITEMNAME"))
+                        if not item_name:
+                            continue
+
+                        quantity = int(round(float(resolve_quantity(entry))))
+                        unit_price = resolve_rate(entry)
+                        discount_pct, discount_amount = resolve_discount(entry)
+
+                        if discount_pct and not discount_amount:
+                            discount_amount = round(quantity * unit_price * discount_pct / 100, 2)
+
+                        subtotal = round(
+                            abs(source_number(entry.get("AMOUNT")))
+                            if get_text(entry.get("AMOUNT"))
+                            else (quantity * unit_price) - discount_amount,
+                            2,
+                        )
+                        tax_pct, tax_amount = resolve_tax(entry, quantity, unit_price)
+                        line_total = round(subtotal + tax_amount, 2)
+
+                        row = {
+                            "purchase_invoice_id": purchase_invoice_id,
+                            "product_name": item_name,
+                            "product_code": None,
+                            "quantity": quantity, # numeric column allows floats
+                            "free_quantity": 0,
+                            "unit_price": round(unit_price, 4),
+                            "gst_rate": tax_pct,
+                            "gst_amount": round(tax_amount, 2),
+                            "total_amount": line_total,
+                            "discount_percentage": discount_pct,
+                            "discount_amount": discount_amount,
+                            "company_name": company_name,
+                            "guid": f"{guid}-{idx}",
+                            "alter_id": voucher_alter_id,
+                        }
+                        items_list.append(row)
+                        chunk_items.append(row)
+                except Exception as ve:
+                    logging.error(
+                        f"Voucher Error Purchase Items {get_text(voucher.get('VOUCHERNUMBER')) or '<no number>'} "
+                        f"({start_date}-{end_date}): {ve}"
                     )
-                    tax_pct, tax_amount = resolve_tax(entry, quantity, unit_price)
-                    line_total = round(subtotal + tax_amount, 2)
 
-                    row = {
-                        "purchase_invoice_id": purchase_invoice_id,
-                        "product_name": item_name,
-                        "product_code": None,
-                        "quantity": quantity, # numeric column allows floats
-                        "free_quantity": 0,
-                        "unit_price": round(unit_price, 4),
-                        "gst_rate": tax_pct,
-                        "gst_amount": round(tax_amount, 2),
-                        "total_amount": line_total,
-                        "discount_percentage": discount_pct,
-                        "discount_amount": discount_amount,
-                        "company_name": company_name,
-                        "guid": f"{guid}-{idx}",
-                        "alter_id": voucher_alter_id,
-                    }
-                    items_list.append(row)
-                    chunk_items.append(row)
-
-                if chunk_items:
-                    stage_records("purchase_items", chunk_items, company_name)
-                    logging.info(f"[{chunk_idx}/{total_chunks}] Staged {len(chunk_items)} purchase bill items locally ({start_date}-{end_date})")
-                else:
-                    logging.info(f"[{chunk_idx}/{total_chunks}] 0 new purchase bill items in ({start_date}-{end_date})")
+            # Stage once per date chunk - not after every voucher (that was rewriting
+            # the whole week into SQLite hundreds of times and made full reconcile crawl).
+            if chunk_items:
+                stage_records("purchase_items", chunk_items, company_name)
+                logging.info(f"[{chunk_idx}/{total_chunks}] Staged {len(chunk_items)} purchase bill items locally ({start_date}-{end_date})")
+            else:
+                logging.info(f"[{chunk_idx}/{total_chunks}] 0 new purchase bill items in ({start_date}-{end_date})")
 
         except Exception as e:
             logging.info(f"Chunk Error ({start_date}-{end_date}): {e}")
@@ -347,8 +359,8 @@ def get_purchase_bill_items(company_name: str = None):
         # Breathing gap for Tally single-threaded event loop
         time.sleep(0.5)
 
-    logging.info(f"Skipped {skipped_no_bill} vouchers â€” no matching purchase_invoice in Supabase")
-    logging.info(f"Skipped {skipped_no_items} vouchers â€” no inventory entries found")
+    logging.info(f"Skipped {skipped_no_bill} vouchers - no matching purchase_invoice in Supabase")
+    logging.info(f"Skipped {skipped_no_items} vouchers - no inventory entries found")
 
     return items_list
 

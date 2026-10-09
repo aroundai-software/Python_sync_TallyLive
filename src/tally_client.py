@@ -1,5 +1,6 @@
 import logging
 from .config import load_config
+from .source_values import decode_response
 import requests
 
 
@@ -17,7 +18,7 @@ class TallyClient:
             timeout=timeout,
         )
         response.raise_for_status()
-        return response.text
+        return decode_response(response)
 
     def test_connection(self):
         try:

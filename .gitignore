@@ -1,16 +1,55 @@
+# Python
 venv/
+.venv/
+env/
 __pycache__/
-*.pyc
-
-build/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
 dist/
-dist_deployment/
-dist_deployment.zip
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
 
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Local sync data & logs
 data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
 scratch/
 resync-*/
 
-.env
-*.log
+# Build / packaging outputs
+dist_deployment/
+dist_deployment.zip
+installer_output/
+*.exe
+*.zip
+
+# Keep source specs; ignore generated PyInstaller work trees if reintroduced
+pyinstaller_src/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# Scratch / temp
 payment_perf.xml
+*.tmp
+*.bak

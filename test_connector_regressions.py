@@ -25,6 +25,16 @@ class ConnectorRegressionTests(unittest.TestCase):
         self.assertEqual(source_number('1200.00 AED @ ₹ 26/AED = ₹ 31200.00'),31200)
     def test_no_guessed_foreign_value(self):
         with self.assertRaises(ValueError):source_number('$395.00')
+    def test_stock_unit_conversion_without_inr_mark(self):
+        # Alternate-unit stock balances use '=' without currency marks.
+        self.assertEqual(source_number('10 Nos = 100.5 kg'),100.5)
+        self.assertEqual(source_number('1.000 MT = 1000.000 kg'),1000.0)
+        self.assertEqual(source_number('34800.6 kg'),34800.6)
+        self.assertEqual(source_number('5.00 Nos'),5.0)
+    def test_foreign_conversion_accepts_plain_converted_amount(self):
+        # Tally often omits ₹/INR on the converted side; still take that number.
+        self.assertEqual(source_number('$395.00 @ 95.6905/$ = 37797.75'),37797.75)
+        self.assertEqual(source_number('1200.00 AED @ 26/AED = 31200.00'),31200)
     def test_empty_missing_is_not_fabricated(self):
         self.assertIsNone(source_number('',None))
     def test_native_credit_debit_suffixes(self):
@@ -34,6 +44,24 @@ class ConnectorRegressionTests(unittest.TestCase):
         value=decode_response(SimpleNamespace(content='<ENVELOPE><NAME>St. Joseph’s Convent</NAME></ENVELOPE>'.encode('utf-16')))
         self.assertIn('Joseph’s',value)
         self.assertEqual(ET.fromstring(clean_source_xml('<NAME>A&#8217;B&#4;</NAME>')).text,'A’B')
+    def test_cp1252_nbsp_fallback(self):
+        # Tally Windows exports often include 0xA0 (NBSP) outside UTF-8.
+        payload=b'<ENVELOPE><NAME>BESTEEL\xa0KUMMENCHERY</NAME></ENVELOPE>'
+        self.assertIn('BESTEEL\u00a0KUMMENCHERY',decode_response(SimpleNamespace(content=payload)))
+    def test_fractional_stock_qty_rounds_and_keeps_value(self):
+        scope=functions('stock_items.py',{'_integer_quantity','_qty_rate_from_closing','safe_float','get_text','clean_text'},{'source_number':source_number,'effective_dict':effective_dict})
+        self.assertEqual(scope['_integer_quantity'](301.4),301)
+        self.assertEqual(scope['_integer_quantity'](72.5),72)  # round-half-even / banker's for .5 toward even
+        qty,rate=scope['_qty_rate_from_closing']({'CLOSINGBALANCE':'301.4 kg','CLOSINGVALUE':'60280.00','CLOSINGRATE':'200'})
+        self.assertEqual(qty,301)
+        self.assertAlmostEqual(qty*rate,60280.00,places=2)
+    def test_sale_parse_qty_honours_unit_conversion(self):
+        from src.sale_bill_item import parse_qty
+        from src.purchase_bill_item import parse_qty as purchase_parse_qty
+        self.assertEqual(parse_qty('5.00 Nos'),5.0)
+        self.assertEqual(parse_qty('10 Nos = 100.5 kg'),100.5)
+        self.assertEqual(parse_qty('34800.6 kg'),34800.6)
+        self.assertEqual(purchase_parse_qty('10 Nos = 100.5 kg'),100.5)
     def test_company_currency_is_native(self):
         self.assertEqual(company_currency({'BASECURRENCYNAME':'₹'}),'INR')
         with patch.dict(os.environ,{'TALLY_BASE_CURRENCY':''}):

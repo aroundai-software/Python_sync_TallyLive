@@ -445,9 +445,7 @@ def reconcile_deleted_daybook(company_name: str) -> int:
                     <COLLECTION NAME="AllDaybookGuids">
                         <TYPE>Voucher</TYPE>
                         <FETCH>GUID,ISDELETED,ISCANCELLED</FETCH>
-                        <FILTER>DateFilter</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="DateFilter">$Date &gt;= $$Date:"{fy_start}" AND $Date &lt;= $$Date:"{fy_end}"</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>

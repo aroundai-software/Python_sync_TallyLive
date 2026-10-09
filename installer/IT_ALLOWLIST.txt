@@ -1,0 +1,73 @@
+TallyLive Sync — IT allowlist / firewall & antivirus guide
+============================================================
+Product : TallyLive Sync (Tally ERP/Prime → TallyLive cloud sync)
+Use     : Shown in the Setup wizard. Also saved after install at:
+          C:\Program Files\TallyLive Sync\IT_ALLOWLIST.txt
+          Share with IT if sync / auto-update is blocked.
+
+1) INSTALL FOLDER (whitelist entire folder)
+------------------------------------------
+  C:\Program Files\TallyLive Sync\
+
+2) EXECUTABLES
+--------------
+  C:\Program Files\TallyLive Sync\Tallylive_python_sync_background\Tallylive_python_sync_background.exe
+  C:\Program Files\TallyLive Sync\Tallylive_sync_settings.exe
+  C:\Program Files\TallyLive Sync\Tallylive_updater.exe
+  C:\Program Files\TallyLive Sync\myserviceinstaller.exe
+
+3) WINDOWS SERVICE
+------------------
+  Name    : TallyLive Sync Service
+  Startup : Automatic (Delayed)
+
+4) NETWORK — OUTBOUND (required for cloud sync + auto-update)
+-------------------------------------------------------------
+  Protocol : HTTPS
+  Port     : 443
+  Host     : gwerbqebixlmniqzlhuk.supabase.co
+  Optional : *.supabase.co  (if a wider rule is preferred)
+
+  No inbound ports need to be opened on the firewall.
+
+5) NETWORK — LOCAL (same PC only)
+---------------------------------
+  Host : 127.0.0.1 / localhost
+  Port : 9000
+  Use  : Tally HTTP / ODBC server (must be enabled in Tally)
+
+6) ANTIVIRUS / WINDOWS DEFENDER
+-------------------------------
+  Exclude folder from real-time scan if EXEs or updates are quarantined:
+    C:\Program Files\TallyLive Sync\
+
+  Auto-update downloads a zip over HTTPS, then replaces files under the
+  install folder and restarts the Windows service. AV may flag this
+  unless the folder (or publisher) is trusted.
+
+7) INSTALL REQUIREMENTS
+-----------------------
+  - Run the Setup EXE as Administrator
+  - Tally open with company loaded and HTTP port 9000 listening
+  - Internet access to Supabase (for upload + optional auto-update)
+
+8) WHAT TO CHECK IF SOMETHING FAILS
+-----------------------------------
+  Service running?
+    services.msc → "TallyLive Sync Service"
+
+  Sync log:
+    C:\Program Files\TallyLive Sync\Tallylive_python_sync_background\sync.log
+
+  Update log (after an auto-update attempt):
+    C:\Program Files\TallyLive Sync\logs\update.log
+
+  Settings UI (Start Menu):
+    "TallyLive Sync Settings"
+
+9) UNINSTALL
+------------
+  Uninstall only "TallyLive Sync" from Windows Apps & features.
+  Settings is part of the same product (not a separate uninstall).
+
+Contact your TallyLive administrator for the official Setup installer.

@@ -207,12 +207,8 @@ def get_max_alter_id(table_name: str, company_name: str) -> int:
     return 0
 
 def _integer_quantity(qty) -> int:
-    """ItemQuantity is an integer column; refuse to silently truncate fractions."""
-    if not float(qty).is_integer():
-        raise ValueError(
-            f"Fractional stock quantity {qty} requires a numeric quantity column"
-        )
-    return int(qty)
+    """ItemQuantity is an integer column; round weight-based fractional qty."""
+    return int(round(float(qty)))
 
 
 def _qty_rate_from_closing(item) -> tuple:
@@ -228,6 +224,9 @@ def _qty_rate_from_closing(item) -> tuple:
     elif qty == 0:
         rate = abs(rate)
     qty_out = _integer_quantity(qty)
+    # Re-derive rate after rounding so ClosingValue stays the source of truth.
+    if qty_out != 0 and val != 0:
+        rate = abs(val / qty_out)
     # Keep enough decimals so sum(qty*rate) matches Tally to the paisa
     rate_out = round(rate, 6)
     return qty_out, rate_out

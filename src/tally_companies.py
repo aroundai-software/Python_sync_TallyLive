@@ -3,6 +3,7 @@ import re
 import requests
 import xmltodict
 from datetime import datetime, timezone
+from xml.sax.saxutils import escape
 
 from supabase import create_client
 
@@ -127,9 +128,55 @@ def clean_tally_xml(xml_text):
 # TALLY FETCH
 # =====================================================
 
-def extract_company_dict(company):
+def get_base_currency_name(company_name):
+    """
+    Tally does not return the base currency on the Company object. It is only
+    available from the Currency collection, and only over a UTF-16 request --
+    a UTF-8 request flattens the symbol to '?'.
+    """
+    xml_request = f"""<ENVELOPE>
+    <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE><ID>BaseCurrency</ID></HEADER>
+    <BODY><DESC><STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        <SVCURRENTCOMPANY>{escape(company_name)}</SVCURRENTCOMPANY>
+    </STATICVARIABLES><TDL><TDLMESSAGE>
+        <COLLECTION NAME="BaseCurrency"><TYPE>Currency</TYPE>
+        <FETCH>NAME,ORIGINALSYMBOL,MAILINGNAME</FETCH></COLLECTION>
+    </TDLMESSAGE></TDL></DESC></BODY>
+</ENVELOPE>"""
+    config = load_config()
+    try:
+        response = requests.post(
+            config["tally_url"],
+            data=xml_request.encode("utf-16"),
+            headers={"Content-Type": "text/xml;charset=utf-16", "Connection": "close"},
+            timeout=60
+        )
+        response.raise_for_status()
+        data = xmltodict.parse(clean_tally_xml(decode_response(response)))
+        collection = (
+            data.get("ENVELOPE", {}).get("BODY", {}).get("DATA", {}).get("COLLECTION", {})
+        ) or {}
+        currencies = collection.get("CURRENCY", [])
+        if isinstance(currencies, dict):
+            currencies = [currencies]
+        for cur in currencies:
+            if not isinstance(cur, dict):
+                continue
+            name = get_text(cur.get("MAILINGNAME")) or get_text(cur.get("ORIGINALSYMBOL")) or get_text(cur.get("@NAME"))
+            if name:
+                return name
+    except Exception as e:
+        logging.warning(f"Could not read base currency for {company_name}: {e}")
+    return ""
+
+
+def extract_company_dict(company, base_currency_name=""):
     address_parts = get_address_parts(company)
     books_from = get_text(company.get("BOOKSFROM"))
+    if base_currency_name:
+        company = dict(company, BASECURRENCYMAILINGNAME=base_currency_name)
 
     return {
         "company_name": get_text(company.get("NAME")),
@@ -218,7 +265,8 @@ def get_all_companies_details():
 
     result = []
     for c in companies:
-        c_dict = extract_company_dict(c)
+        name = get_text(c.get("NAME"))
+        c_dict = extract_company_dict(c, get_base_currency_name(name) if name else "")
         if c_dict.get("company_name"):
             result.append(c_dict)
 
