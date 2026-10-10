@@ -186,11 +186,33 @@ def check_script_control(company_name: str) -> bool:
                 logging.info(f"[PAUSED] Sync is paused remotely via Admin Panel for {machine_hostname}.")
 
             last_known_sync_state = bool(should_run and not is_expired)
+
+        # Record every company this machine syncs (for app subscription warnings).
+        _upsert_machine_company(supabase, machine_hostname, company_name, now_utc)
             
     except Exception as e:
         logging.warning(f"Could not reach Supabase for script_control. Using last known state (run={last_known_sync_state}). Error: {e}")
         
     return last_known_sync_state
+
+
+def _upsert_machine_company(supabase, machine_name: str, company_name: str, now_utc: str) -> None:
+    """Keep machine_companies in sync so the app can resolve expiry for any loaded company."""
+    if not company_name or company_name == "Unknown":
+        return
+    try:
+        supabase.table("machine_companies").upsert(
+            {
+                "machine_name": machine_name,
+                "company_name": company_name,
+                "last_seen_at": now_utc,
+                "updated_at": now_utc,
+            },
+            on_conflict="machine_name,company_name",
+        ).execute()
+    except Exception as e:
+        # Table may not exist until migration is applied — do not fail the sync cycle.
+        logging.warning(f"machine_companies upsert skipped for {company_name}: {e}")
 # --- END NEW SCRIPT CONTROL VARIABLES ---
 
 def run_sync_cycle():
