@@ -1,8 +1,10 @@
 """
-Balance Sheet & Profit and Loss snapshots from Tally -> Supabase.
+Balance Sheet & Profit and Loss snapshots from Tally -> local SQLite -> Supabase.
 
-Heavy report exports run twice per local day (first sync + random 2–4 PM slot)
-so normal hourly cycles stay fast and remote Tally is not hit every interval.
+Heavy report exports run twice per local day (first sync + random 2–4 PM slot).
+Remote Tally uses long waits; soft retries (~50 min, max 3/slot) recover from
+timeouts without hourly storms. Main sync runs FR after Phase 3 and treats
+FR failure as a non-fatal warning.
 
 Usage:
     python -m src.financial_reports
@@ -28,17 +30,61 @@ from xml.sax.saxutils import escape
 
 import requests
 
-# Fail-fast: prefer skip + next cycle over stalling Tally.
-_REPORT_TIMEOUT: Union[int, tuple] = (20, 240)
-_REPORT_RETRIES = 2
 # Second daily slot: local time window [14:00, 16:00)
 _AFTERNOON_START_HOUR = 14
 _AFTERNOON_END_HOUR = 16
+
+# Soft retry within a slot (avoids hourly storms; still allows same-day recovery).
+_MAX_ATTEMPTS_PER_SLOT = 3
+_RETRY_DELAY_MINUTES = 50
+
+# Local Tally (LAN/localhost): can afford longer report waits.
+_LOCAL_REPORT_TIMEOUT: Union[int, tuple] = (15, 300)
+_LOCAL_REPORT_RETRIES = 2
+# Cloud / remote Tally (HostWinCloud etc.): reports often need several minutes.
+# Prefer waiting and succeeding over a quick timeout that leaves BS/P&L empty.
+# Override with FINANCIAL_REPORTS_REMOTE_TIMEOUT (seconds) / FINANCIAL_REPORTS_REMOTE_RETRIES.
+_REMOTE_REPORT_TIMEOUT: Union[int, tuple] = (20, 360)
+_REMOTE_REPORT_RETRIES = 2
 
 from .config import load_config
 from .paths import get_app_dir
 from .source_values import clean_source_xml, decode_response, source_number
 from .tally_companies import get_all_companies_details, get_company_details
+
+
+def is_remote_tally(tally_host: Optional[str] = None) -> bool:
+    """True when Tally is not on this machine (cloud / remote host)."""
+    host = (tally_host or "").strip()
+    if not host:
+        try:
+            host = str(load_config().get("tally_host") or "")
+        except Exception:
+            host = ""
+    host = host.lower().replace("http://", "").replace("https://", "").split(":")[0].strip()
+    return host not in ("", "localhost", "127.0.0.1", "::1")
+
+
+def report_export_settings() -> tuple:
+    """Return (timeout, retries, is_remote) tuned for local vs cloud Tally."""
+    remote = is_remote_tally()
+    if remote:
+        try:
+            read_secs = int(
+                os.environ.get("FINANCIAL_REPORTS_REMOTE_TIMEOUT", "360").strip()
+            )
+        except ValueError:
+            read_secs = 360
+        read_secs = max(60, min(read_secs, 900))
+        try:
+            retries = int(
+                os.environ.get("FINANCIAL_REPORTS_REMOTE_RETRIES", "2").strip()
+            )
+        except ValueError:
+            retries = 2
+        retries = max(1, min(retries, 4))
+        return (20, read_secs), retries, True
+    return _LOCAL_REPORT_TIMEOUT, _LOCAL_REPORT_RETRIES, False
 
 logger = logging.getLogger(__name__)
 
@@ -111,19 +157,23 @@ def _parse_amount(raw: Optional[str]) -> Optional[float]:
 
 
 def indian_fy_start(as_on: Optional[date] = None, books_from_iso: Optional[str] = None) -> date:
-    """Indian FY starts 1 April. Prefer books_from year when provided."""
+    """
+    Report period start = current Indian FY (1 April), not older books_from years.
+    If books began after this FY start, use books_from (new company mid-year).
+    """
     as_on = as_on or date.today()
+    if as_on.month >= 4:
+        fy = date(as_on.year, 4, 1)
+    else:
+        fy = date(as_on.year - 1, 4, 1)
     if books_from_iso:
         try:
             bf = date.fromisoformat(str(books_from_iso)[:10])
-            if bf.month >= 4:
-                return date(bf.year, 4, 1)
-            return date(bf.year - 1, 4, 1)
+            if bf > fy:
+                return bf
         except Exception:
             pass
-    if as_on.month >= 4:
-        return date(as_on.year, 4, 1)
-    return date(as_on.year - 1, 4, 1)
+    return fy
 
 
 def _classify_bs_section(name: str) -> str:
@@ -173,20 +223,26 @@ def export_tally_report(
     from_date: date,
     to_date: date,
     timeout: Union[int, tuple, None] = None,
-    retries: int = _REPORT_RETRIES,
+    retries: Optional[int] = None,
 ) -> str:
     """POST report export to Tally; return cleaned XML text. Retries on timeout."""
     config = load_config()
+    auto_timeout, auto_retries, remote = report_export_settings()
     xml_request = build_report_xml(
         report_id=report_id,
         company_name=company_name,
         from_date_yyyymmdd=from_date.strftime("%Y%m%d"),
         to_date_yyyymmdd=to_date.strftime("%Y%m%d"),
     )
-    timeout = _REPORT_TIMEOUT if timeout is None else timeout
+    timeout = auto_timeout if timeout is None else timeout
+    retries = auto_retries if retries is None else retries
     last_err: Optional[Exception] = None
     for attempt in range(1, max(1, retries) + 1):
         try:
+            logging.info(
+                f"Tally report '{report_id}' "
+                f"({'remote' if remote else 'local'}) attempt {attempt}/{retries}..."
+            )
             response = requests.post(
                 config["tally_url"],
                 data=xml_request.encode("utf-8"),
@@ -207,7 +263,12 @@ def export_tally_report(
                 f"timed out/unreachable: {e}"
             )
             if attempt < retries:
-                time.sleep(2 * attempt)
+                # Remote Tally often needs a longer cool-down between heavy reports.
+                pause = (8 * attempt) if remote else (2 * attempt)
+                logging.info(
+                    f"Waiting {pause}s before retrying Tally report '{report_id}'..."
+                )
+                time.sleep(pause)
         except Exception:
             raise
     raise RuntimeError(
@@ -215,30 +276,59 @@ def export_tally_report(
     )
 
 
+def _xml_local_tag(tag: Optional[str]) -> str:
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _findall_by_tag(root: ET.Element, tag_name: str) -> list:
+    """Find nodes by local tag name anywhere under root (flat or ENVELOPE-wrapped)."""
+    direct = [n for n in list(root) if _xml_local_tag(n.tag) == tag_name]
+    if direct:
+        return direct
+    return [n for n in root.iter() if _xml_local_tag(n.tag) == tag_name]
+
+
+def _child_text(node: ET.Element, *paths: str) -> str:
+    for path in paths:
+        found = node.find(path)
+        if found is not None and (found.text or "").strip():
+            return (found.text or "").strip()
+        # namespace-tolerant: walk children
+        parts = path.split("/")
+        cur = node
+        ok = True
+        for part in parts:
+            nxt = None
+            for ch in list(cur):
+                if _xml_local_tag(ch.tag) == part:
+                    nxt = ch
+                    break
+            if nxt is None:
+                ok = False
+                break
+            cur = nxt
+        if ok and (cur.text or "").strip():
+            return (cur.text or "").strip()
+    return ""
+
+
 def parse_balance_sheet_xml(xml_text: str) -> list[ReportLine]:
     root = ET.fromstring(xml_text)
-    names = [n.findtext("DSPACCNAME/DSPDISPNAME") or n.findtext("DSPDISPNAME") or "" for n in root.findall("BSNAME")]
-    # BSNAME may wrap DSPACCNAME; also handle flat children order
-    if not names:
-        names = []
-        for node in list(root):
-            if node.tag == "BSNAME":
-                names.append(
-                    (node.findtext("DSPACCNAME/DSPDISPNAME") or node.findtext("DSPDISPNAME") or "").strip()
-                )
-
-    amts = root.findall("BSAMT")
+    name_nodes = _findall_by_tag(root, "BSNAME")
+    amt_nodes = _findall_by_tag(root, "BSAMT")
     lines: list[ReportLine] = []
-    for i, name_node in enumerate(root.findall("BSNAME")):
+    for i, name_node in enumerate(name_nodes):
         particulars = (
-            name_node.findtext("DSPACCNAME/DSPDISPNAME")
-            or name_node.findtext("DSPDISPNAME")
+            _child_text(name_node, "DSPACCNAME/DSPDISPNAME", "DSPDISPNAME")
             or ""
-        ).strip()
-        particulars = particulars.replace("&amp;", "&")
-        amt_node = amts[i] if i < len(amts) else None
-        raw_main = (amt_node.findtext("BSMAINAMT") if amt_node is not None else None) or ""
-        raw_sub = (amt_node.findtext("BSSUBAMT") if amt_node is not None else None) or ""
+        ).replace("&amp;", "&")
+        amt_node = amt_nodes[i] if i < len(amt_nodes) else None
+        raw_main = _child_text(amt_node, "BSMAINAMT") if amt_node is not None else ""
+        raw_sub = _child_text(amt_node, "BSSUBAMT") if amt_node is not None else ""
         amount = _parse_amount(raw_main) or 0.0
         sub_amount = _parse_amount(raw_sub)
         lines.append(
@@ -256,17 +346,40 @@ def parse_balance_sheet_xml(xml_text: str) -> list[ReportLine]:
 
 def parse_profit_loss_xml(xml_text: str) -> list[ReportLine]:
     root = ET.fromstring(xml_text)
-    # Condensed P&L: repeating DSPACCNAME + PLAMT siblings
-    children = list(root)
+    # Prefer walking the subtree that actually holds DSPACCNAME rows
+    scan_roots = [root]
+    for cand in root.iter():
+        if _xml_local_tag(cand.tag) in ("DATA", "COLLECTION", "ENVELOPE", "BODY"):
+            scan_roots.append(cand)
+
+    children = []
+    for scan in scan_roots:
+        kids = list(scan)
+        if any(_xml_local_tag(k.tag) == "DSPACCNAME" for k in kids):
+            children = kids
+            break
+    if not children:
+        # Fallback: flatten alternating name/amount via iter order
+        flat = [
+            n
+            for n in root.iter()
+            if _xml_local_tag(n.tag) in ("DSPACCNAME", "PLAMT")
+        ]
+        children = flat
+
     lines: list[ReportLine] = []
     i = 0
     while i < len(children):
         node = children[i]
-        if node.tag == "DSPACCNAME":
-            particulars = (node.findtext("DSPDISPNAME") or "").strip().replace("&amp;", "&")
-            amt_node = children[i + 1] if i + 1 < len(children) and children[i + 1].tag == "PLAMT" else None
-            raw_main = (amt_node.findtext("BSMAINAMT") if amt_node is not None else None) or ""
-            raw_sub = (amt_node.findtext("PLSUBAMT") if amt_node is not None else None) or ""
+        if _xml_local_tag(node.tag) == "DSPACCNAME":
+            particulars = (
+                _child_text(node, "DSPDISPNAME") or ""
+            ).replace("&amp;", "&")
+            amt_node = None
+            if i + 1 < len(children) and _xml_local_tag(children[i + 1].tag) == "PLAMT":
+                amt_node = children[i + 1]
+            raw_main = _child_text(amt_node, "BSMAINAMT") if amt_node is not None else ""
+            raw_sub = _child_text(amt_node, "PLSUBAMT") if amt_node is not None else ""
             main = _parse_amount(raw_main)
             sub = _parse_amount(raw_sub)
             amount = main if main is not None else (sub if sub is not None else 0.0)
@@ -274,9 +387,31 @@ def parse_profit_loss_xml(xml_text: str) -> list[ReportLine]:
             low = particulars.lower()
             if "cost of sales" in low or low.startswith("add:") or low.startswith("less:"):
                 section = "expenses"
-            elif any(k in low for k in ("purchase", "direct expenses", "indirect expenses", "gross profit c", "nett loss", "net loss", "closing stock")):
+            elif any(
+                k in low
+                for k in (
+                    "purchase",
+                    "direct expenses",
+                    "indirect expenses",
+                    "gross profit c",
+                    "nett loss",
+                    "net loss",
+                    "closing stock",
+                )
+            ):
                 section = "expenses"
-            elif any(k in low for k in ("sales accounts", "direct incomes", "indirect incomes", "gross profit b", "nett profit", "net profit", "opening stock")):
+            elif any(
+                k in low
+                for k in (
+                    "sales accounts",
+                    "direct incomes",
+                    "indirect incomes",
+                    "gross profit b",
+                    "nett profit",
+                    "net profit",
+                    "opening stock",
+                )
+            ):
                 section = "incomes"
             lines.append(
                 ReportLine(
@@ -387,33 +522,42 @@ def _prefer_ledger_guid(candidates: list[dict], company_guid: str) -> Optional[d
     return ranked[0][1]
 
 
-def _load_ledger_lookup(client, company_name: str, company_guid: str) -> dict[str, dict]:
+def _load_ledger_lookup(company_name: str, company_guid: str) -> dict[str, dict]:
     """
-    Map lowercase ledger name -> {guid, ledger_type} from customers.
+    Map lowercase ledger name -> {guid, ledger_type} from local customers SQLite.
     Used to fill ledger_guid / mark row_type=ledger on report lines.
     """
+    from .local_db import get_connection
+
     lookup: dict[str, list[dict]] = {}
-    page_size = 1000
-    offset = 0
-    while True:
-        res = (
-            client.table("customers")
-            .select("customer_name,guid,ledger_type")
-            .eq("company_name", company_name)
-            .range(offset, offset + page_size - 1)
-            .execute()
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='customers'"
         )
-        rows = res.data or []
-        if not rows:
-            break
+        if not cur.fetchone():
+            return {}
+        rows = conn.execute(
+            "SELECT customer_name, guid, ledger_type FROM customers "
+            "WHERE company_name = ?",
+            (company_name,),
+        ).fetchall()
         for row in rows:
-            name = (row.get("customer_name") or "").strip()
+            name = (row["customer_name"] or "").strip()
             if not name:
                 continue
-            lookup.setdefault(name.casefold(), []).append(row)
-        if len(rows) < page_size:
-            break
-        offset += page_size
+            lookup.setdefault(name.casefold(), []).append(
+                {
+                    "customer_name": name,
+                    "guid": row["guid"],
+                    "ledger_type": row["ledger_type"],
+                }
+            )
+    except Exception as e:
+        logging.warning(f"Could not load local ledger lookup: {e}")
+        return {}
+    finally:
+        conn.close()
 
     resolved: dict[str, dict] = {}
     for key, candidates in lookup.items():
@@ -450,11 +594,11 @@ def _is_report_label(particulars: str) -> bool:
 
 def _build_line_row(
     *,
-    report_id: str,
     snapshot: ReportSnapshot,
     line: ReportLine,
     idx: int,
     ledger_lookup: dict[str, dict],
+    line_prefix: str,
 ) -> dict:
     debit, credit, dr_cr = _line_debit_credit(line)
     display = _line_display_amount(line)
@@ -479,15 +623,18 @@ def _build_line_row(
             elif any(x in lt for x in ("expense", "purchase")):
                 section = "expenses"
 
+    line_key = _slug_key(particulars)
+    # Local PK; stripped on Phase 3 upload (cloud lines use report_id).
+    line_guid = f"{snapshot.company_guid}#{line_prefix}#{idx:05d}#{line_key}"
     return {
-        "report_id": report_id,
+        "guid": line_guid,
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
         "row_type": row_type,
         "section": section,
         "particulars": particulars,
         "tally_group_name": ledger_type or particulars,
-        "line_key": _slug_key(particulars),
+        "line_key": line_key,
         "parent_line_key": _slug_key(ledger_type) if ledger_type and row_type == "ledger" else None,
         "amount": round(display, 2),
         "debit": round(debit, 2),
@@ -500,25 +647,12 @@ def _build_line_row(
     }
 
 
-def _replace_report_lines(client, lines_table: str, report_id: str, rows: list[dict]) -> int:
-    client.table(lines_table).delete().eq("report_id", report_id).execute()
-    if not rows:
-        return 0
-    # PostgREST prefers modest batches
-    batch_size = 200
-    saved = 0
-    for i in range(0, len(rows), batch_size):
-        chunk = rows[i : i + batch_size]
-        client.table(lines_table).insert(chunk).execute()
-        saved += len(chunk)
-    return saved
-
-
 def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
-    """Upsert BS report by company_guid and replace all lines (full snapshot)."""
+    """Stage BS report + lines into local SQLite (Phase 3 pushes to Supabase)."""
     if not snapshot.company_guid:
         raise ValueError("company_guid is required to save balance sheet")
-    client = _supabase_client()
+    from .local_db import save_to_local_db
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # Cr (positive signed) → Liabilities; Dr (negative signed) → Assets (Tally sides).
@@ -541,6 +675,7 @@ def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
             liab += abs(gap)
 
     report_payload = {
+        "guid": snapshot.company_guid,
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
         "as_on_date": snapshot.to_date,
@@ -550,34 +685,20 @@ def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
         "synced_at": now_iso,
         "updated_at": now_iso,
     }
-    upserted = (
-        client.table("balance_sheet_reports")
-        .upsert(report_payload, on_conflict="company_guid")
-        .execute()
+    staged_reports = save_to_local_db(
+        "balance_sheet_reports", [report_payload], snapshot.company_name
     )
-    report_row = (upserted.data or [None])[0]
-    if not report_row or not report_row.get("id"):
-        # Some PostgREST configs return no representation — fetch id
-        fetched = (
-            client.table("balance_sheet_reports")
-            .select("id")
-            .eq("company_guid", snapshot.company_guid)
-            .limit(1)
-            .execute()
-        )
-        report_row = (fetched.data or [None])[0]
-    if not report_row or not report_row.get("id"):
-        raise RuntimeError("Failed to upsert balance_sheet_reports row")
+    if staged_reports < 1:
+        raise RuntimeError("Failed to stage balance_sheet_reports to local DB")
 
-    report_id = report_row["id"]
-    ledger_lookup = _load_ledger_lookup(client, snapshot.company_name, snapshot.company_guid)
+    ledger_lookup = _load_ledger_lookup(snapshot.company_name, snapshot.company_guid)
     line_rows = [
         _build_line_row(
-            report_id=report_id,
             snapshot=snapshot,
             line=line,
             idx=idx,
             ledger_lookup=ledger_lookup,
+            line_prefix="bs",
         )
         for idx, line in enumerate(snapshot.lines)
     ]
@@ -586,9 +707,15 @@ def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
         f"Balance Sheet lines: {len(line_rows)} total, {matched} with ledger_guid "
         f"(lookup size={len(ledger_lookup)})"
     )
-
-    saved_lines = _replace_report_lines(client, "balance_sheet_lines", report_id, line_rows)
-    return {"report_id": report_id, "lines": saved_lines, "lines_with_guid": matched}
+    saved_lines = save_to_local_db(
+        "balance_sheet_lines", line_rows, snapshot.company_name
+    )
+    return {
+        "report_guid": snapshot.company_guid,
+        "lines": saved_lines,
+        "lines_with_guid": matched,
+        "staged_local": True,
+    }
 
 
 def _pl_line_abs(line: ReportLine) -> float:
@@ -624,14 +751,16 @@ def _compute_pl_gross_nett(lines: list[ReportLine]) -> tuple[float, float]:
 
 
 def save_profit_loss_snapshot(snapshot: ReportSnapshot) -> dict:
-    """Upsert P&L report by company_guid and replace all lines (full snapshot)."""
+    """Stage P&L report + lines into local SQLite (Phase 3 pushes to Supabase)."""
     if not snapshot.company_guid:
         raise ValueError("company_guid is required to save profit and loss")
-    client = _supabase_client()
+    from .local_db import save_to_local_db
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     gross, nett = _compute_pl_gross_nett(snapshot.lines)
     report_payload = {
+        "guid": snapshot.company_guid,
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
         "from_date": snapshot.from_date,
@@ -645,33 +774,20 @@ def save_profit_loss_snapshot(snapshot: ReportSnapshot) -> dict:
         "synced_at": now_iso,
         "updated_at": now_iso,
     }
-    upserted = (
-        client.table("profit_loss_reports")
-        .upsert(report_payload, on_conflict="company_guid")
-        .execute()
+    staged_reports = save_to_local_db(
+        "profit_loss_reports", [report_payload], snapshot.company_name
     )
-    report_row = (upserted.data or [None])[0]
-    if not report_row or not report_row.get("id"):
-        fetched = (
-            client.table("profit_loss_reports")
-            .select("id")
-            .eq("company_guid", snapshot.company_guid)
-            .limit(1)
-            .execute()
-        )
-        report_row = (fetched.data or [None])[0]
-    if not report_row or not report_row.get("id"):
-        raise RuntimeError("Failed to upsert profit_loss_reports row")
+    if staged_reports < 1:
+        raise RuntimeError("Failed to stage profit_loss_reports to local DB")
 
-    report_id = report_row["id"]
-    ledger_lookup = _load_ledger_lookup(client, snapshot.company_name, snapshot.company_guid)
+    ledger_lookup = _load_ledger_lookup(snapshot.company_name, snapshot.company_guid)
     line_rows = [
         _build_line_row(
-            report_id=report_id,
             snapshot=snapshot,
             line=line,
             idx=idx,
             ledger_lookup=ledger_lookup,
+            line_prefix="pl",
         )
         for idx, line in enumerate(snapshot.lines)
     ]
@@ -680,9 +796,15 @@ def save_profit_loss_snapshot(snapshot: ReportSnapshot) -> dict:
         f"Profit & Loss lines: {len(line_rows)} total, {matched} with ledger_guid "
         f"(lookup size={len(ledger_lookup)})"
     )
-
-    saved_lines = _replace_report_lines(client, "profit_loss_lines", report_id, line_rows)
-    return {"report_id": report_id, "lines": saved_lines, "lines_with_guid": matched}
+    saved_lines = save_to_local_db(
+        "profit_loss_lines", line_rows, snapshot.company_name
+    )
+    return {
+        "report_guid": snapshot.company_guid,
+        "lines": saved_lines,
+        "lines_with_guid": matched,
+        "staged_local": True,
+    }
 
 
 def financial_reports_enabled() -> bool:
@@ -715,6 +837,145 @@ def _schedule_path() -> str:
     data_dir = os.path.join(get_app_dir(), "data")
     os.makedirs(data_dir, exist_ok=True)
     return os.path.join(data_dir, "financial_reports_schedule.json")
+
+
+def _attempts_path() -> str:
+    data_dir = os.path.join(get_app_dir(), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "financial_reports_attempts.json")
+
+
+def _load_attempts() -> dict:
+    path = _attempts_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.warning(f"Could not read financial report attempts: {e}")
+    return {}
+
+
+def _save_attempts(data: dict) -> None:
+    try:
+        with open(_attempts_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Could not save financial report attempts: {e}")
+
+
+def _slot_from_reason(reason: str) -> str:
+    r = (reason or "").lower()
+    if "afternoon" in r:
+        return "afternoon"
+    return "morning"
+
+
+def _fresh_attempts_entry(today: str) -> dict:
+    return {
+        "date": today,
+        "morning_attempts": 0,
+        "afternoon_attempts": 0,
+        "morning_exhausted": False,
+        "afternoon_exhausted": False,
+        "next_retry_after": None,
+        "last_error_at": None,
+        "last_reason": None,
+    }
+
+
+def _normalize_attempts_entry(entry: dict, today: str) -> dict:
+    """Migrate legacy morning_failed/afternoon_failed flags to soft-retry fields."""
+    if not entry or entry.get("date") != today:
+        return _fresh_attempts_entry(today)
+    out = _fresh_attempts_entry(today)
+    out["morning_attempts"] = int(entry.get("morning_attempts") or 0)
+    out["afternoon_attempts"] = int(entry.get("afternoon_attempts") or 0)
+    out["morning_exhausted"] = bool(entry.get("morning_exhausted"))
+    out["afternoon_exhausted"] = bool(entry.get("afternoon_exhausted"))
+    # Legacy hard-fail → treat as exhausted for that slot
+    if entry.get("morning_failed"):
+        out["morning_exhausted"] = True
+        out["morning_attempts"] = max(out["morning_attempts"], _MAX_ATTEMPTS_PER_SLOT)
+    if entry.get("afternoon_failed"):
+        out["afternoon_exhausted"] = True
+        out["afternoon_attempts"] = max(
+            out["afternoon_attempts"], _MAX_ATTEMPTS_PER_SLOT
+        )
+    out["next_retry_after"] = entry.get("next_retry_after")
+    out["last_error_at"] = entry.get("last_error_at")
+    out["last_reason"] = entry.get("last_reason")
+    return out
+
+
+def _parse_retry_after(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_local_now().tzinfo)
+        return dt.astimezone(_local_now().tzinfo)
+    except Exception:
+        return None
+
+
+def mark_financial_reports_attempt_failed(company_guid: str, reason: str) -> dict:
+    """
+    Soft failure: increment slot attempts, set next_retry_after (~50 min).
+    Exhaust the slot only after _MAX_ATTEMPTS_PER_SLOT failures.
+    Returns the updated attempts entry.
+    """
+    guid = (company_guid or "").strip()
+    today = _local_now().date().isoformat()
+    data = _load_attempts()
+    entry = _normalize_attempts_entry(data.get(guid) or {}, today)
+    slot = _slot_from_reason(reason)
+    key_attempts = f"{slot}_attempts"
+    key_exhausted = f"{slot}_exhausted"
+    entry[key_attempts] = int(entry.get(key_attempts) or 0) + 1
+    entry["last_error_at"] = _local_now().isoformat()
+    entry["last_reason"] = reason
+    if entry[key_attempts] >= _MAX_ATTEMPTS_PER_SLOT:
+        entry[key_exhausted] = True
+        entry["next_retry_after"] = None
+        logging.warning(
+            f"Financial reports {slot} slot exhausted for {guid} "
+            f"after {entry[key_attempts]} attempt(s); wait for next scheduled slot."
+        )
+    else:
+        retry_at = _local_now() + timedelta(minutes=_RETRY_DELAY_MINUTES)
+        entry["next_retry_after"] = retry_at.isoformat()
+        entry[key_exhausted] = False
+        logging.warning(
+            f"Financial reports {slot} attempt {entry[key_attempts]}/"
+            f"{_MAX_ATTEMPTS_PER_SLOT} failed for {guid}; "
+            f"next retry after {retry_at.strftime('%H:%M')} local."
+        )
+    data[guid] = entry
+    _save_attempts(data)
+    return entry
+
+
+def mark_financial_reports_slot_failed(company_guid: str, reason: str) -> None:
+    """Backward-compatible alias → soft attempt failure."""
+    mark_financial_reports_attempt_failed(company_guid, reason)
+
+
+def clear_financial_reports_retry_state(company_guid: str) -> None:
+    """Clear retry delay after a successful BS+P&L stage."""
+    guid = (company_guid or "").strip()
+    if not guid:
+        return
+    today = _local_now().date().isoformat()
+    data = _load_attempts()
+    entry = _normalize_attempts_entry(data.get(guid) or {}, today)
+    entry["next_retry_after"] = None
+    entry["last_error_at"] = None
+    entry["last_reason"] = None
+    data[guid] = entry
+    _save_attempts(data)
 
 
 def _afternoon_target_local(today: date) -> datetime:
@@ -763,32 +1024,66 @@ def _afternoon_target_local(today: date) -> datetime:
 
 
 def _last_reports_synced_local(company_guid: str) -> Optional[datetime]:
-    """Earliest of BS/P&L synced_at in local timezone; None if either missing."""
+    """
+    Earliest of BS/P&L synced_at from local SQLite when both headers exist
+    and each has at least one staged line — used for 2×/day schedule.
+    """
     guid = (company_guid or "").strip()
     if not guid:
         return None
     try:
-        client = _supabase_client()
-        bs = (
-            client.table("balance_sheet_reports")
-            .select("synced_at")
-            .eq("company_guid", guid)
-            .limit(1)
-            .execute()
-        )
-        pl = (
-            client.table("profit_loss_reports")
-            .select("synced_at")
-            .eq("company_guid", guid)
-            .limit(1)
-            .execute()
-        )
-        bs_at = _parse_synced_at(((bs.data or [None])[0] or {}).get("synced_at"))
-        pl_at = _parse_synced_at(((pl.data or [None])[0] or {}).get("synced_at"))
-        if not bs_at or not pl_at:
-            return None
-        earliest = min(bs_at, pl_at)
-        return earliest.astimezone(_local_now().tzinfo)
+        from .local_db import get_connection
+
+        conn = get_connection()
+        try:
+            times = []
+            pairs = (
+                ("balance_sheet_reports", "balance_sheet_lines"),
+                ("profit_loss_reports", "profit_loss_lines"),
+            )
+            for reports_table, lines_table in pairs:
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (reports_table,),
+                )
+                if not cur.fetchone():
+                    return None
+                row = conn.execute(
+                    f'SELECT synced_at, company_name FROM "{reports_table}" '
+                    f'WHERE company_guid = ? OR guid = ? LIMIT 1',
+                    (guid, guid),
+                ).fetchone()
+                if not row:
+                    return None
+                parsed = _parse_synced_at(row["synced_at"])
+                if not parsed:
+                    return None
+                # Require lines so an empty/header-only stage does not close the slot
+                cur_lines = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (lines_table,),
+                )
+                if not cur_lines.fetchone():
+                    return None
+                company_name = (row["company_name"] or "").strip()
+                if company_name:
+                    line_count = conn.execute(
+                        f'SELECT COUNT(*) AS c FROM "{lines_table}" '
+                        f"WHERE company_name = ?",
+                        (company_name,),
+                    ).fetchone()["c"]
+                else:
+                    line_count = conn.execute(
+                        f'SELECT COUNT(*) AS c FROM "{lines_table}" '
+                        f"WHERE company_guid = ?",
+                        (guid,),
+                    ).fetchone()["c"]
+                if not line_count:
+                    return None
+                times.append(parsed)
+            return min(times).astimezone(_local_now().tzinfo)
+        finally:
+            conn.close()
     except Exception as e:
         logging.warning(f"Could not read last financial report sync time: {e}")
         return None
@@ -799,6 +1094,9 @@ def financial_reports_due(company_guid: str) -> tuple[bool, str]:
     Twice daily:
       1) first sync of the local calendar day
       2) once at a random time between 2:00 PM and 4:00 PM local
+
+    Soft retries: after a timeout, wait ~50 minutes (next_retry_after) and
+    retry up to 3 times per slot before moving on.
     """
     if os.environ.get("FULL_RECONCILE", "").strip().lower() in ("1", "true", "yes"):
         return True, "full_reconcile"
@@ -806,12 +1104,36 @@ def financial_reports_due(company_guid: str) -> tuple[bool, str]:
     now = _local_now()
     today = now.date()
     last = _last_reports_synced_local(company_guid)
-
-    # Slot 1 — first sync of the day (no successful BS+P&L yet today)
-    if last is None or last.date() < today:
-        return True, "first_of_day"
-
+    attempts = _normalize_attempts_entry(
+        _load_attempts().get((company_guid or "").strip()) or {},
+        today.isoformat(),
+    )
+    morning_exhausted = bool(attempts.get("morning_exhausted"))
+    afternoon_exhausted = bool(attempts.get("afternoon_exhausted"))
+    retry_after = _parse_retry_after(attempts.get("next_retry_after"))
     target = _afternoon_target_local(today)
+
+    def _respect_retry_delay(slot_label: str) -> tuple[bool, str]:
+        if retry_after and now < retry_after:
+            return False, (
+                f"deferred_retry_after({retry_after.strftime('%H:%M')},{slot_label})"
+            )
+        return True, slot_label
+
+    # Slot 1 — first sync of the day (no complete local BS+P&L yet today)
+    if last is None or last.date() < today:
+        if morning_exhausted:
+            if afternoon_exhausted:
+                return False, "both_slots_exhausted_today"
+            if now < target:
+                return False, (
+                    f"morning_exhausted_wait_afternoon({target.strftime('%H:%M')})"
+                )
+            return _respect_retry_delay(f"afternoon_slot({target.strftime('%H:%M')})")
+        attempts_n = int(attempts.get("morning_attempts") or 0)
+        if attempts_n > 0:
+            return _respect_retry_delay(f"morning_retry({attempts_n + 1})")
+        return True, "first_of_day"
 
     # Already completed the afternoon slot today
     if last >= target:
@@ -821,7 +1143,14 @@ def financial_reports_due(company_guid: str) -> tuple[bool, str]:
     if now < target:
         return False, f"waiting_afternoon({target.strftime('%H:%M')})"
 
-    # Now past target and last sync was before target → afternoon run
+    if afternoon_exhausted:
+        return False, "afternoon_exhausted_today"
+
+    attempts_n = int(attempts.get("afternoon_attempts") or 0)
+    if attempts_n > 0:
+        return _respect_retry_delay(
+            f"afternoon_retry({attempts_n + 1},{target.strftime('%H:%M')})"
+        )
     return True, f"afternoon_slot({target.strftime('%H:%M')})"
 
 
@@ -831,16 +1160,20 @@ def sync_financial_reports(
     books_from_iso: Optional[str] = None,
     as_on: Optional[date] = None,
     force: bool = False,
+    push_now: bool = False,
 ) -> dict:
     """
-    Export BS + P&L from Tally and overwrite Supabase snapshots for this company.
+    Export BS + P&L from Tally and stage snapshots into local SQLite.
 
-    Schedule (unless force=True): first sync of the day, then once more at a
-    random local time between 2 PM and 4 PM.
+    Returns a dict with status:
+      ok | skipped | deferred | failed
+    Does not raise on Tally timeout (soft retry); callers treat failed/deferred
+    as non-fatal for the overall sync cycle.
     """
     if not financial_reports_enabled() and not force:
         logging.info("Financial reports disabled (FINANCIAL_REPORTS=0); skipping.")
         return {
+            "status": "skipped",
             "skipped": True,
             "reason": "disabled",
             "bs_line_count": 0,
@@ -857,25 +1190,39 @@ def sync_financial_reports(
         company_name = company.get("company_name") or company_name
 
     if not guid:
-        raise ValueError(f"No company_guid available for {company_name}")
+        return {
+            "status": "failed",
+            "skipped": False,
+            "reason": f"No company_guid available for {company_name}",
+            "bs_line_count": 0,
+            "pl_line_count": 0,
+        }
 
+    due_reason = "forced"
     if not force:
-        due, reason = financial_reports_due(guid)
+        due, due_reason = financial_reports_due(guid)
         if not due:
+            status = "deferred" if str(due_reason).startswith("deferred_") else "skipped"
             logging.info(
-                f"Financial reports for {company_name} not due ({reason}); skipping."
+                f"Financial reports for {company_name} not due ({due_reason}); skipping."
             )
             return {
+                "status": status,
                 "skipped": True,
-                "reason": reason,
+                "deferred": status == "deferred",
+                "reason": due_reason,
                 "company_name": company_name,
                 "company_guid": guid,
                 "bs_line_count": 0,
                 "pl_line_count": 0,
             }
-        logging.info(f"Financial reports due for {company_name}: {reason}")
+        logging.info(f"Financial reports due for {company_name}: {due_reason}")
 
-    logging.info(f"Exporting Balance Sheet & Profit and Loss for {company_name}...")
+    _, _, remote = report_export_settings()
+    logging.info(
+        f"Exporting Balance Sheet & Profit and Loss for {company_name} "
+        f"({'remote/cloud Tally' if remote else 'local Tally'})..."
+    )
     errors: list[str] = []
     bs = None
     pl = None
@@ -887,39 +1234,92 @@ def sync_financial_reports(
         errors.append(f"Balance Sheet: {e}")
         logging.error(f"Balance Sheet export failed for {company_name}: {e}")
 
-    # Brief pause so remote Tally can recover between heavy report exports
-    time.sleep(1.0)
-
-    try:
-        pl = fetch_profit_and_loss(
-            company_name, guid, as_on=as_on, books_from_iso=books_from
+    # If BS already timed out on remote Tally, skip P&L this attempt.
+    # Local Tally still tries both — LAN can usually finish.
+    if bs is None and remote:
+        errors.append(
+            "Profit and Loss: skipped after Balance Sheet failure (remote Tally)"
         )
-    except Exception as e:
-        errors.append(f"Profit and Loss: {e}")
-        logging.error(f"Profit and Loss export failed for {company_name}: {e}")
+        logging.warning(
+            f"Skipping Profit and Loss for {company_name} after remote BS failure "
+            f"to avoid further Tally load this attempt."
+        )
+    else:
+        time.sleep(5.0 if remote else 0.5)
+        try:
+            pl = fetch_profit_and_loss(
+                company_name, guid, as_on=as_on, books_from_iso=books_from
+            )
+        except Exception as e:
+            errors.append(f"Profit and Loss: {e}")
+            logging.error(f"Profit and Loss export failed for {company_name}: {e}")
 
     bs_saved = {"lines": 0}
     pl_saved = {"lines": 0}
     if bs is not None:
-        bs_saved = save_balance_sheet_snapshot(bs)
+        if not bs.lines:
+            errors.append("Balance Sheet: Tally returned no parseable lines")
+            logging.error(f"Balance Sheet empty for {company_name}")
+            bs = None
+        else:
+            bs_saved = save_balance_sheet_snapshot(bs)
     if pl is not None:
-        pl_saved = save_profit_loss_snapshot(pl)
+        if not pl.lines:
+            errors.append("Profit and Loss: Tally returned no parseable lines")
+            logging.error(f"Profit and Loss empty for {company_name}")
+            pl = None
+        else:
+            pl_saved = save_profit_loss_snapshot(pl)
 
     logging.info(
-        f"Saved financial reports for {company_name}: "
+        f"Staged financial reports locally for {company_name}: "
         f"BS lines={bs_saved.get('lines', 0)}, P&L lines={pl_saved.get('lines', 0)}"
     )
 
-    if errors and bs is None and pl is None:
-        raise RuntimeError("; ".join(errors))
-    if errors:
-        raise RuntimeError(
-            "Partial financial reports sync: "
-            + "; ".join(errors)
-            + f" (saved BS={bs is not None}, P&L={pl is not None})"
+    if errors and (bs is None or pl is None):
+        attempt_entry = mark_financial_reports_attempt_failed(guid, due_reason)
+        retry_after = attempt_entry.get("next_retry_after")
+        msg = "; ".join(errors)
+        if bs is not None and pl is None:
+            msg = (
+                f"Partial financial reports: {msg} "
+                f"(saved BS=True, P&L=False)"
+            )
+        elif bs is None and pl is not None:
+            msg = (
+                f"Partial financial reports: {msg} "
+                f"(saved BS=False, P&L=True)"
+            )
+        return {
+            "status": "failed",
+            "skipped": False,
+            "deferred": bool(retry_after),
+            "reason": msg,
+            "company_name": company_name,
+            "company_guid": guid,
+            "as_on": as_on.isoformat(),
+            "balance_sheet": bs_saved,
+            "profit_and_loss": pl_saved,
+            "bs_line_count": len(bs.lines) if bs else 0,
+            "pl_line_count": len(pl.lines) if pl else 0,
+            "next_retry_after": retry_after,
+            "errors": errors,
+        }
+
+    clear_financial_reports_retry_state(guid)
+
+    push_results = None
+    push_errors: list[str] = []
+    if push_now:
+        from .local_db import push_financial_reports_for_company
+
+        client = _supabase_client()
+        push_results, push_errors = push_financial_reports_for_company(
+            client, company_name
         )
 
     return {
+        "status": "ok",
         "skipped": False,
         "company_name": company_name,
         "company_guid": guid,
@@ -928,6 +1328,8 @@ def sync_financial_reports(
         "profit_and_loss": pl_saved,
         "bs_line_count": len(bs.lines) if bs else 0,
         "pl_line_count": len(pl.lines) if pl else 0,
+        "push": push_results,
+        "push_errors": push_errors,
     }
 
 
@@ -1073,19 +1475,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--save",
         action="store_true",
-        help="Save snapshots to Supabase (requires sync write RLS policies)",
+        help="Stage to local DB and push to Supabase (requires sync write RLS policies)",
     )
     args = parser.parse_args(argv)
 
     as_on = date.fromisoformat(args.as_on) if args.as_on else date.today()
     try:
         if args.save:
-            result = sync_financial_reports(company_name=args.company or "", as_on=as_on)
-            print(json.dumps(result, indent=2))
-            print("\nStep 3 OK: financial reports saved to Supabase.")
-            return 0
+            result = sync_financial_reports(
+                company_name=args.company or "",
+                as_on=as_on,
+                force=True,
+                push_now=True,
+            )
+            print(json.dumps(result, indent=2, default=str))
+            if result.get("status") == "ok":
+                if result.get("push_errors"):
+                    print("\nStaged OK but cloud push had errors:", result["push_errors"])
+                    return 1
+                print("\nOK: financial reports staged locally and pushed to Supabase.")
+                return 0
+            print(f"\nFinancial reports status={result.get('status')}: {result.get('reason')}")
+            return 1
         run_spike(company_name=args.company, as_on=as_on)
-        print("\nExport + parse succeeded. Use --save to write to Supabase.")
+        print("\nExport + parse succeeded. Use --save to stage locally and push to Supabase.")
         return 0
     except Exception as exc:
         logger.error("Financial reports FAILED: %s", exc)

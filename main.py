@@ -189,7 +189,7 @@ def check_script_control(company_name: str) -> bool:
 
         # Record every company this machine syncs (for app subscription warnings).
         _upsert_machine_company(supabase, machine_hostname, company_name, now_utc)
-            
+
     except Exception as e:
         logging.warning(f"Could not reach Supabase for script_control. Using last known state (run={last_known_sync_state}). Error: {e}")
         
@@ -491,13 +491,13 @@ def run_sync_cycle():
             logging.info(f"Completed Phase 1 local extraction for company: {company_name}")
 
             # ===================================================================
-            # PHASE 2: TALLY IS 100% FREED UP & IDLE
+            # PHASE 2: TALLY IS 100% FREED UP & IDLE (core modules only)
             # ===================================================================
             # Keep status messages ASCII-safe: WinSW/cp1252 must not abort Phase 3.
             logging.info("=" * 65)
             logging.info(
                 f"[OK] PHASE 1 COMPLETE: Core modules staged for {company_name} "
-                f"(financial reports run after cloud upload, when due)"
+                f"(BS/P&L run after cloud upload when due)"
             )
             logging.info("[OK] TALLY IS NOW IDLE (Zero Tally load).")
             logging.info("=" * 65)
@@ -514,6 +514,7 @@ def run_sync_cycle():
             print(f"[Phase 3/3] Uploading pending records to Supabase Cloud for {company_name}...\n")
             upload_failed = False
             upload_error = ""
+            supabase_client = None
             try:
                 from src.config import load_config
                 from supabase import create_client
@@ -535,22 +536,49 @@ def run_sync_cycle():
                 for err in push_errors:
                     logger.note_error(f"Phase 3: {err}")
                 
-                # Check remaining pending counts
+                # Pending FR snapshots are handled in step 14 after this push —
+                # do not mark core upload failed solely for those tables.
+                from src.local_db import (
+                    FINANCIAL_REPORT_HEADER_TABLES,
+                    FINANCIAL_REPORT_LINE_TABLES,
+                )
+
+                fr_tables = FINANCIAL_REPORT_HEADER_TABLES | FINANCIAL_REPORT_LINE_TABLES
                 counts = get_table_counts(company_name=company_name)
-                total_pending = sum(c.get("pending", 0) for c in counts.values())
-                if total_pending == 0 and not push_errors:
-                    logging.info(f"[OK] All local records are in sync with Supabase for {company_name}!")
-                    print(f"\n[OK] All local records are in sync with Supabase for {company_name}!\n")
+                core_pending = sum(
+                    c.get("pending", 0)
+                    for tbl, c in counts.items()
+                    if tbl not in fr_tables
+                )
+                fr_pending = sum(
+                    c.get("pending", 0)
+                    for tbl, c in counts.items()
+                    if tbl in fr_tables
+                )
+                # FR-only push errors are non-fatal for core sync status
+                core_push_errors = [
+                    e for e in push_errors
+                    if not any(t in str(e) for t in fr_tables)
+                ]
+                if core_pending == 0 and not core_push_errors:
+                    logging.info(f"[OK] Core local records are in sync with Supabase for {company_name}!")
+                    print(f"\n[OK] Core local records are in sync with Supabase for {company_name}!\n")
+                    if fr_pending:
+                        logging.info(
+                            f"[INFO] {fr_pending} financial-report row(s) still pending "
+                            f"(step 14 will refresh/push when due)"
+                        )
                 else:
                     upload_failed = True
-                    # Detailed table/row errors already in error_details via note_error
-                    if total_pending:
+                    if core_pending:
                         upload_error = (
-                            f"Phase 3 incomplete: {total_pending} records remain pending "
+                            f"Phase 3 incomplete: {core_pending} core records remain pending "
                             f"in SQLite (will retry next cycle)"
                         )
-                    elif push_errors:
-                        upload_error = f"Phase 3 upload errors on {len(push_errors)} table(s)/batch(es)"
+                    elif core_push_errors:
+                        upload_error = (
+                            f"Phase 3 upload errors on {len(core_push_errors)} table(s)/batch(es)"
+                        )
                     logging.warning(f"[WARN] {upload_error or 'Phase 3 reported errors'}")
             except Exception as e:
                 upload_failed = True
@@ -558,8 +586,9 @@ def run_sync_cycle():
                 logging.error(f"[ERROR] Phase 3 Supabase push failed for {company_name}: {e}")
                 print(f"[ERROR] Supabase push failed: {e}. Data remains safely stored in local SQLite.")
 
-            # 14. Balance Sheet & Profit and Loss — after Phase 3; twice daily
-            # (first sync of day + random 2-4 PM local) so hourly cycles stay fast.
+            # 14. Balance Sheet & Profit and Loss — after Phase 3 (patient remote waits).
+            # FR timeout/defer is non-fatal: note_error + step_passed so core sync
+            # stays "completed" when books data uploaded successfully.
             try:
                 print(f" [14/14] Financial reports (BS/P&L) for {company_name}...\n")
                 fr = financial_reports.sync_financial_reports(
@@ -568,24 +597,69 @@ def run_sync_cycle():
                     books_from_iso=company_data.get("books_from")
                     or company_data.get("financial_year_from"),
                 )
-                if fr.get("skipped"):
-                    reason = fr.get("reason") or "skipped"
+                fr_status = fr.get("status") or (
+                    "skipped" if fr.get("skipped") else "ok"
+                )
+                if fr_status in ("skipped", "deferred"):
+                    reason = fr.get("reason") or fr_status
                     logging.info(
-                        f"[14/14] Financial reports skipped for {company_name} ({reason})"
+                        f"[14/14] Financial reports {fr_status} for {company_name} ({reason})"
                     )
-                    print(f" [14/14] Financial reports skipped ({reason})\n")
+                    print(f" [14/14] Financial reports {fr_status} ({reason})\n")
+                    if fr_status == "deferred":
+                        logger.note_error(f"FR deferred: {reason}")
+                elif fr_status == "failed":
+                    reason = fr.get("reason") or "financial reports failed"
+                    retry = fr.get("next_retry_after")
+                    detail = f"FR warning: {reason}"
+                    if retry:
+                        detail += f" (next retry after {retry})"
+                    logging.warning(f"[14/14] {detail}")
+                    print(f" [14/14] Financial reports deferred/failed (non-fatal)\n")
+                    logger.note_error(detail)
                 else:
                     bs_n = fr.get("bs_line_count", 0)
                     pl_n = fr.get("pl_line_count", 0)
                     logging.info(
-                        f"Synced financial reports for {company_name}: "
-                        f"BS={bs_n} lines, P&L={pl_n} lines"
+                        f"Staged financial reports for {company_name}: "
+                        f"BS={bs_n} lines, P&L={pl_n} lines (local DB)"
                     )
-                    print(f" [14/14] Synced Financial Reports (BS={bs_n}, P&L={pl_n})\n")
+                    print(
+                        f" [14/14] Staged Financial Reports locally "
+                        f"(BS={bs_n}, P&L={pl_n})\n"
+                    )
+                    # Push FR snapshots now (staged after Phase 3 core upload).
+                    if supabase_client is not None:
+                        try:
+                            from src.local_db import push_financial_reports_for_company
+
+                            fr_push, fr_push_errs = push_financial_reports_for_company(
+                                supabase_client, company_name
+                            )
+                            for tbl, cnt in (fr_push or {}).items():
+                                if cnt:
+                                    logging.info(
+                                        f"   - {tbl}: {cnt} financial report rows pushed"
+                                    )
+                                    print(f"   - {tbl}: {cnt} records pushed to Supabase")
+                            for err in fr_push_errs or []:
+                                logger.note_error(f"FR push: {err}")
+                        except Exception as push_e:
+                            logger.note_error(
+                                f"FR push: {format_error(push_e)}"
+                            )
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
-                logger.step_failed(f"Financial reports sync failed: {format_error(e)}")
+                # Unexpected errors still must not fail the whole sync cycle.
+                logger.note_error(
+                    f"FR warning: {format_error(e)}"
+                )
+                logging.warning(
+                    f"[14/14] Financial reports unexpected error (non-fatal): {e}"
+                )
+                print(f" [14/14] Financial reports warning (non-fatal)\n")
+                logger.step_passed()
 
             logger.finish(upload_failed=upload_failed, upload_error=upload_error)
 

@@ -29,6 +29,10 @@ TABLE_MAP = {
     "tally_daybook": "tally_daybook",
     "settled_bills": "ledger_bill_settlements",
     "ledger_bill_settlements": "ledger_bill_settlements",
+    "balance_sheet_reports": "balance_sheet_reports",
+    "balance_sheet_lines": "balance_sheet_lines",
+    "profit_loss_reports": "profit_loss_reports",
+    "profit_loss_lines": "profit_loss_lines",
 }
 
 ALL_TABLES = [
@@ -45,7 +49,29 @@ ALL_TABLES = [
     "outstanding_payables",
     "tally_daybook",
     "ledger_bill_settlements",
+    "balance_sheet_reports",
+    "balance_sheet_lines",
+    "profit_loss_reports",
+    "profit_loss_lines",
 ]
+
+# Full-replace snapshots: wipe company rows before staging a new extract.
+SNAPSHOT_TABLES = {
+    "outstanding_receivables",
+    "outstanding_payables",
+    "balance_sheet_reports",
+    "balance_sheet_lines",
+    "profit_loss_reports",
+    "profit_loss_lines",
+}
+
+# Parent report + child lines (pushed together; lines table skipped in generic loop).
+FINANCIAL_REPORT_PAIRS = (
+    ("balance_sheet_reports", "balance_sheet_lines"),
+    ("profit_loss_reports", "profit_loss_lines"),
+)
+FINANCIAL_REPORT_LINE_TABLES = {pair[1] for pair in FINANCIAL_REPORT_PAIRS}
+FINANCIAL_REPORT_HEADER_TABLES = {pair[0] for pair in FINANCIAL_REPORT_PAIRS}
 
 INTERNAL_COLS = {"_sync_status", "_synced_at", "_sync_error"}
 
@@ -230,7 +256,7 @@ def save_to_local_db(table_name: str, records: list, company_name: str = "") -> 
             _ensure_table_schema(conn, table_name, sample)
 
             # Snapshot tables: clear only this exact company
-            if table_name in ("outstanding_receivables", "outstanding_payables"):
+            if table_name in SNAPSHOT_TABLES:
                 conn.execute(
                     f'DELETE FROM "{table_name}" WHERE {_exact_company_clause()}',
                     (company_name,),
@@ -714,7 +740,12 @@ _INTEGER_FIELDS_BY_TABLE = {
     "outstanding_payables": {"overdue_days", "credit_days"},
     "tally_daybook": {"alter_id"},
     "ledger_bill_settlements": {"days_to_clear", "days_from_due_date", "alter_id"},
+    "balance_sheet_lines": {"sort_order"},
+    "profit_loss_lines": {"sort_order"},
 }
+
+# Local-only PK; Supabase report headers conflict on company_guid; lines use report_id.
+_FINANCIAL_UPLOAD_STRIP = {"guid", "id", "report_id"}
 
 _TEXT_FIELDS_BY_TABLE = {
     # master_id is TEXT on all tables
@@ -1240,20 +1271,268 @@ def push_local_table_to_supabase(
     return total_synced, last_error
 
 
+def _load_local_financial_report(reports_table: str, company_name: str):
+    """Latest local report header for company (any sync status)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (reports_table,),
+        )
+        if not cur.fetchone():
+            return None
+        company_name = _require_company_name(company_name, f"fr:{reports_table}")
+        row = conn.execute(
+            f'SELECT * FROM "{reports_table}" WHERE {_exact_company_clause()} LIMIT 1',
+            (company_name,),
+        ).fetchone()
+        if not row:
+            return None
+        return {k: row[k] for k in row.keys()}
+    except Exception as e:
+        logging.warning(f"[LocalDB] Could not load local {reports_table}: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _load_local_financial_lines(lines_table: str, company_name: str) -> list:
+    """All local line rows for company (snapshot replace on push)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (lines_table,),
+        )
+        if not cur.fetchone():
+            return []
+        company_name = _require_company_name(company_name, f"fr:{lines_table}")
+        rows = conn.execute(
+            f'SELECT * FROM "{lines_table}" WHERE {_exact_company_clause()} '
+            f'ORDER BY sort_order ASC',
+            (company_name,),
+        ).fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+    except Exception as e:
+        logging.warning(f"[LocalDB] Could not load local {lines_table}: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _financial_report_needs_push(
+    reports_table: str, lines_table: str, company_name: str
+) -> bool:
+    """True if header or any line is still pending/failed for this company."""
+    conn = get_connection()
+    try:
+        company_name = _require_company_name(company_name, "fr:needs_push")
+        for table_name in (reports_table, lines_table):
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            if not cur.fetchone():
+                continue
+            row = conn.execute(
+                f'SELECT 1 FROM "{table_name}" WHERE {_exact_company_clause()} '
+                f'AND _sync_status IN ("pending", "failed") LIMIT 1',
+                (company_name,),
+            ).fetchone()
+            if row:
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def push_financial_report_snapshot(
+    supabase,
+    company_name: str,
+    reports_table: str,
+    lines_table: str,
+) -> tuple:
+    """
+    Upsert report header (on company_guid), replace all remote lines, mark local synced.
+    Same replace-snapshot semantics as the former direct Supabase write.
+    """
+    if not company_name:
+        return 0, f"{reports_table}: company_name is required"
+
+    if not _financial_report_needs_push(reports_table, lines_table, company_name):
+        return 0, None
+
+    report = _load_local_financial_report(reports_table, company_name)
+    if not report:
+        return 0, f"{reports_table}: no local snapshot for {company_name}"
+
+    company_guid = (report.get("company_guid") or report.get("guid") or "").strip()
+    if not company_guid:
+        return 0, f"{reports_table}: missing company_guid for {company_name}"
+
+    from .error_format import format_error
+
+    report_payload = {
+        k: v
+        for k, v in report.items()
+        if k not in INTERNAL_COLS and k not in _FINANCIAL_UPLOAD_STRIP
+    }
+    report_payload["company_name"] = company_name
+    report_payload["company_guid"] = company_guid
+    for bk in ("show_gross_profit",):
+        if bk in report_payload and report_payload[bk] is not None:
+            v = report_payload[bk]
+            if isinstance(v, bool):
+                pass
+            elif isinstance(v, (int, float)):
+                report_payload[bk] = bool(int(v))
+            else:
+                report_payload[bk] = str(v).strip().lower() in ("1", "true", "yes")
+    report_payload = _coerce_record_types(report_payload, reports_table)
+
+    try:
+        upserted = (
+            supabase.table(reports_table)
+            .upsert(report_payload, on_conflict="company_guid")
+            .execute()
+        )
+        report_row = (upserted.data or [None])[0]
+        if not report_row or not report_row.get("id"):
+            fetched = (
+                supabase.table(reports_table)
+                .select("id")
+                .eq("company_guid", company_guid)
+                .limit(1)
+                .execute()
+            )
+            report_row = (fetched.data or [None])[0]
+        if not report_row or not report_row.get("id"):
+            return 0, f"{reports_table}: failed to upsert / resolve report id"
+        report_id = report_row["id"]
+    except Exception as e:
+        err = f"{reports_table}: {format_error(e)}"
+        logging.warning(f"[LocalDB->Supabase] {err}")
+        mark_records_failed(
+            reports_table, [report.get("guid") or company_guid], err, company_name=company_name
+        )
+        return 0, err
+
+    local_lines = _load_local_financial_lines(lines_table, company_name)
+    upload_lines = []
+    line_guids = []
+    for row in local_lines:
+        guid = row.get("guid")
+        rec = {
+            k: v
+            for k, v in row.items()
+            if k not in INTERNAL_COLS and k not in _FINANCIAL_UPLOAD_STRIP
+        }
+        rec["report_id"] = report_id
+        rec["company_name"] = company_name
+        rec["company_guid"] = company_guid
+        # Booleans may be stored as 0/1 in SQLite
+        for bk in ("is_total", "is_calculated"):
+            if bk in rec and rec[bk] is not None:
+                v = rec[bk]
+                if isinstance(v, bool):
+                    rec[bk] = v
+                elif isinstance(v, (int, float)):
+                    rec[bk] = bool(int(v))
+                else:
+                    rec[bk] = str(v).strip().lower() in ("1", "true", "yes")
+        upload_lines.append(_coerce_record_types(rec, lines_table))
+        if guid:
+            line_guids.append(str(guid))
+
+    try:
+        supabase.table(lines_table).delete().eq("report_id", report_id).execute()
+        batch_size = 200
+        for i in range(0, len(upload_lines), batch_size):
+            chunk = upload_lines[i : i + batch_size]
+            if chunk:
+                supabase.table(lines_table).insert(chunk).execute()
+    except Exception as e:
+        err = f"{lines_table}: {format_error(e)}"
+        logging.warning(f"[LocalDB->Supabase] {err}")
+        mark_records_failed(
+            reports_table, [report.get("guid") or company_guid], err, company_name=company_name
+        )
+        if line_guids:
+            mark_records_failed(lines_table, line_guids, err, company_name=company_name)
+        return 0, err
+
+    mark_records_synced(
+        reports_table, [report.get("guid") or company_guid], company_name=company_name
+    )
+    if line_guids:
+        mark_records_synced(lines_table, line_guids, company_name=company_name)
+
+    total = 1 + len(upload_lines)
+    logging.info(
+        f"[LocalDB->Supabase] Synced {reports_table}+{lines_table} for {company_name}: "
+        f"1 report, {len(upload_lines)} lines"
+    )
+    return total, None
+
+
+def push_financial_reports_for_company(supabase, company_name: str) -> tuple:
+    """Push both BS and P&L snapshots for one company. Returns (results, errors)."""
+    results = {}
+    errors = []
+    for reports_table, lines_table in FINANCIAL_REPORT_PAIRS:
+        count, err = push_financial_report_snapshot(
+            supabase, company_name, reports_table, lines_table
+        )
+        if count and count > 1:
+            results[reports_table] = 1
+            results[lines_table] = count - 1
+        else:
+            results[reports_table] = count or 0
+            results[lines_table] = 0
+        if err:
+            errors.append(err)
+    return results, errors
+
+
 def push_all_pending_to_supabase(supabase, company_name: str = None) -> tuple:
     """
-    Pushes all pending records across all 13 dedicated tables to Supabase.
-    Follows proper relational dependency order (companies -> masters -> vouchers -> items).
+    Pushes all pending records across dedicated tables to Supabase.
+    Follows proper relational dependency order (companies -> masters -> vouchers -> items
+    -> financial report snapshots).
     Returns (results_dict, errors_list).
     """
     results = {}
     errors = []
     for table_name in ALL_TABLES:
+        # Child line tables are pushed with their report headers.
+        if table_name in FINANCIAL_REPORT_LINE_TABLES:
+            results.setdefault(table_name, 0)
+            continue
         try:
-            count, err = push_local_table_to_supabase(
-                table_name, supabase, company_name=company_name
-            )
-            results[table_name] = count
+            if table_name in FINANCIAL_REPORT_HEADER_TABLES:
+                if not company_name:
+                    results[table_name] = 0
+                    errors.append(f"{table_name}: company_name is required")
+                    continue
+                lines_table = next(
+                    lt for ht, lt in FINANCIAL_REPORT_PAIRS if ht == table_name
+                )
+                count, err = push_financial_report_snapshot(
+                    supabase, company_name, table_name, lines_table
+                )
+                if count and count > 1:
+                    results[table_name] = 1
+                    results[lines_table] = count - 1
+                else:
+                    results[table_name] = count
+                    results.setdefault(lines_table, 0)
+            else:
+                count, err = push_local_table_to_supabase(
+                    table_name, supabase, company_name=company_name
+                )
+                results[table_name] = count
             if err:
                 errors.append(err)
         except Exception as e:
