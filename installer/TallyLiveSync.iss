@@ -3,7 +3,7 @@
 ; Expects dist_deployment\ to be populated by build_installer.py first.
 
 #define MyAppName "TallyLive Sync"
-#define MyAppVersion "1.1.7"
+#define MyAppVersion "1.1.9"
 #define MyAppPublisher "TallyLive"
 #define MyAppExeName "Tallylive_python_sync_background.exe"
 

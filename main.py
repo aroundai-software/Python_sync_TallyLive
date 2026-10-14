@@ -46,6 +46,8 @@ else:
 
 from src.config import load_config
 
+_cfg = load_config()
+
 import src.tally_companies as tally_companies
 import src.ledgers as ledgers
 import src.stock_items as stock_items
@@ -81,6 +83,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+if _cfg.get("supabase_using_service_role"):
+    logging.info("Supabase client using baked-in service_role key for sync writes.")
+else:
+    logging.warning(
+        "Baked-in Supabase key is not service_role. "
+        "machine_companies and Balance Sheet / P&L uploads will fail under RLS. "
+        "Update SUPABASE_SERVICE_KEY in src/config.py."
+    )
 
 sync_in_progress = False
 

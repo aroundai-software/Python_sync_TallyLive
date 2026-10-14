@@ -3,8 +3,10 @@ Balance Sheet & Profit and Loss snapshots from Tally -> local SQLite -> Supabase
 
 Heavy report exports run twice per local day (first sync + random 2–4 PM slot).
 Remote Tally uses long waits; soft retries (~50 min, max 3/slot) recover from
-timeouts without hourly storms. Main sync runs FR after Phase 3 and treats
-FR failure as a non-fatal warning.
+timeouts without hourly storms. If Tally returns empty BS+P&L (reports not
+available), the company is marked unavailable and skipped for ~7 days
+(re-check later or on FULL_RECONCILE). Main sync runs FR after Phase 3 and
+treats FR failure as a non-fatal warning.
 
 Usage:
     python -m src.financial_reports
@@ -37,6 +39,8 @@ _AFTERNOON_END_HOUR = 16
 # Soft retry within a slot (avoids hourly storms; still allows same-day recovery).
 _MAX_ATTEMPTS_PER_SLOT = 3
 _RETRY_DELAY_MINUTES = 50
+# When Tally returns empty BS+P&L (reports not set up), skip that company for N days.
+_UNAVAILABLE_RECHECK_DAYS = 7
 
 # Local Tally (LAN/localhost): can afford longer report waits.
 _LOCAL_REPORT_TIMEOUT: Union[int, tuple] = (15, 300)
@@ -845,6 +849,124 @@ def _attempts_path() -> str:
     return os.path.join(data_dir, "financial_reports_attempts.json")
 
 
+def _unavailable_path() -> str:
+    data_dir = os.path.join(get_app_dir(), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "financial_reports_unavailable.json")
+
+
+def _unavailable_recheck_days() -> int:
+    try:
+        days = int(
+            os.environ.get(
+                "FINANCIAL_REPORTS_UNAVAILABLE_DAYS",
+                str(_UNAVAILABLE_RECHECK_DAYS),
+            ).strip()
+        )
+    except ValueError:
+        days = _UNAVAILABLE_RECHECK_DAYS
+    return max(1, min(days, 90))
+
+
+def _load_unavailable() -> dict:
+    path = _unavailable_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.warning(f"Could not read financial reports unavailable map: {e}")
+    return {}
+
+
+def _save_unavailable(data: dict) -> None:
+    try:
+        with open(_unavailable_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Could not save financial reports unavailable map: {e}")
+
+
+def financial_reports_unavailable_until(
+    company_guid: str,
+) -> Optional[date]:
+    """
+    If this company was marked as having no usable BS/P&L in Tally, return the
+    local date until which we should skip (inclusive). None = not unavailable.
+    """
+    guid = (company_guid or "").strip()
+    if not guid:
+        return None
+    entry = _load_unavailable().get(guid) or {}
+    until_raw = entry.get("until")
+    if not until_raw:
+        return None
+    try:
+        until = date.fromisoformat(str(until_raw)[:10])
+    except Exception:
+        return None
+    if _local_now().date() <= until:
+        return until
+    return None
+
+
+def mark_financial_reports_unavailable(
+    company_guid: str,
+    reason: str = "empty_reports",
+) -> date:
+    """Skip FR for this company until today + recheck days (default 7)."""
+    guid = (company_guid or "").strip()
+    days = _unavailable_recheck_days()
+    until = _local_now().date() + timedelta(days=days)
+    if not guid:
+        return until
+    data = _load_unavailable()
+    data[guid] = {
+        "until": until.isoformat(),
+        "reason": reason,
+        "marked_at": _local_now().isoformat(),
+    }
+    _save_unavailable(data)
+    logging.warning(
+        f"Financial reports marked unavailable for {guid} until {until.isoformat()} "
+        f"({reason}); will re-check after that date or on FULL_RECONCILE=1."
+    )
+    return until
+
+
+def clear_financial_reports_unavailable(company_guid: str) -> None:
+    guid = (company_guid or "").strip()
+    if not guid:
+        return
+    data = _load_unavailable()
+    if guid in data:
+        data.pop(guid, None)
+        _save_unavailable(data)
+        logging.info(f"Cleared financial-reports unavailable flag for {guid}")
+
+
+def _errors_look_like_empty_reports(errors: list[str]) -> bool:
+    """True when failure is empty parse only (not timeout / connection)."""
+    if not errors:
+        return False
+    joined = " ".join(errors).lower()
+    if any(
+        x in joined
+        for x in (
+            "timed out",
+            "timeout",
+            "connection",
+            "max retries",
+            "refused",
+            "unreachable",
+        )
+    ):
+        return False
+    empty_markers = sum(1 for e in errors if "no parseable lines" in e.lower())
+    return empty_markers >= 1
+
+
 def _load_attempts() -> dict:
     path = _attempts_path()
     try:
@@ -1198,6 +1320,32 @@ def sync_financial_reports(
             "pl_line_count": 0,
         }
 
+    full_reconcile = os.environ.get("FULL_RECONCILE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Previously empty BS+P&L → skip until re-check date (unless force / full reconcile).
+    if not force and not full_reconcile:
+        until = financial_reports_unavailable_until(guid)
+        if until is not None:
+            reason = f"not_available_until({until.isoformat()})"
+            logging.info(
+                f"Financial reports for {company_name} skipped — Tally reports "
+                f"marked unavailable until {until.isoformat()}."
+            )
+            return {
+                "status": "skipped",
+                "skipped": True,
+                "reason": reason,
+                "company_name": company_name,
+                "company_guid": guid,
+                "bs_line_count": 0,
+                "pl_line_count": 0,
+            }
+    elif full_reconcile:
+        clear_financial_reports_unavailable(guid)
+
     due_reason = "forced"
     if not force:
         due, due_reason = financial_reports_due(guid)
@@ -1277,6 +1425,28 @@ def sync_financial_reports(
     )
 
     if errors and (bs is None or pl is None):
+        # Both empty (no usable lines) → reports not available in Tally; skip ~7 days.
+        if bs is None and pl is None and _errors_look_like_empty_reports(errors):
+            until = mark_financial_reports_unavailable(guid, reason="empty_reports")
+            msg = (
+                f"Tally BS/P&L not available (empty reports); "
+                f"skipping until {until.isoformat()}"
+            )
+            logging.warning(f"{msg} for {company_name}")
+            return {
+                "status": "skipped",
+                "skipped": True,
+                "reason": f"not_available_until({until.isoformat()})",
+                "company_name": company_name,
+                "company_guid": guid,
+                "as_on": as_on.isoformat(),
+                "balance_sheet": bs_saved,
+                "profit_and_loss": pl_saved,
+                "bs_line_count": 0,
+                "pl_line_count": 0,
+                "errors": errors,
+            }
+
         attempt_entry = mark_financial_reports_attempt_failed(guid, due_reason)
         retry_after = attempt_entry.get("next_retry_after")
         msg = "; ".join(errors)
@@ -1307,6 +1477,7 @@ def sync_financial_reports(
         }
 
     clear_financial_reports_retry_state(guid)
+    clear_financial_reports_unavailable(guid)
 
     push_results = None
     push_errors: list[str] = []
