@@ -55,18 +55,7 @@ from .config import load_config
 from .paths import get_app_dir
 from .source_values import clean_source_xml, decode_response, source_number
 from .tally_companies import get_all_companies_details, get_company_details
-
-
-def is_remote_tally(tally_host: Optional[str] = None) -> bool:
-    """True when Tally is not on this machine (cloud / remote host)."""
-    host = (tally_host or "").strip()
-    if not host:
-        try:
-            host = str(load_config().get("tally_host") or "")
-        except Exception:
-            host = ""
-    host = host.lower().replace("http://", "").replace("https://", "").split(":")[0].strip()
-    return host not in ("", "localhost", "127.0.0.1", "::1")
+from .tally_timeouts import is_remote_tally
 
 
 def report_export_settings() -> tuple:
@@ -729,8 +718,17 @@ def _pl_line_abs(line: ReportLine) -> float:
     return abs(raw)
 
 
+def _pl_label_is(particulars: str, label: str) -> bool:
+    """Exact / prefix match — avoids 'indirect incomes' matching 'direct incomes'."""
+    p = (particulars or "").strip().lower()
+    label = (label or "").strip().lower()
+    if not label:
+        return False
+    return p == label or p.startswith(f"{label} ") or p.startswith(f"{label}(")
+
+
 def _compute_pl_gross_nett(lines: list[ReportLine]) -> tuple[float, float]:
-    """Gross / Nett from condensed Tally P&L (Sales − Cost of Sales ± Indirect)."""
+    """Gross / Nett from condensed Tally P&L (Sales + Direct Inc − Cost of Sales ± Indirect)."""
     sales = 0.0
     direct_incomes = 0.0
     cost_of_sales = 0.0
@@ -739,15 +737,15 @@ def _compute_pl_gross_nett(lines: list[ReportLine]) -> tuple[float, float]:
     for line in lines:
         p = (line.particulars or "").strip().lower()
         amt = _pl_line_abs(line)
-        if "sales accounts" in p:
+        if _pl_label_is(p, "sales accounts"):
             sales = amt
-        elif "direct incomes" in p:
+        elif _pl_label_is(p, "direct incomes"):
             direct_incomes = amt
         elif p.startswith("cost of sales"):
             cost_of_sales = amt
-        elif "indirect incomes" in p:
+        elif _pl_label_is(p, "indirect incomes"):
             indirect_incomes = amt
-        elif "indirect expenses" in p:
+        elif _pl_label_is(p, "indirect expenses"):
             indirect_expenses = amt
     gross = sales + direct_incomes - cost_of_sales
     nett = gross + indirect_incomes - indirect_expenses

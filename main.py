@@ -34,10 +34,11 @@ class _SafeStreamHandler(logging.StreamHandler):
 
 
 from src.error_format import format_error
-from src.paths import get_env_path, get_sync_log_path
+from src.paths import get_env_path, get_sync_log_path, promote_settings_from_payload
 from src.version import APP_VERSION
 
-# Load .env FIRST - before any src modules so SYNC_START_YEAR etc. are visible
+# Load .env FIRST - before any src modules so SYNC_START_YEAR etc. are visible.
+# .env lives next to the sync EXE (Program Files install folder).
 _env_path = get_env_path()
 if os.path.isfile(_env_path):
     load_dotenv(_env_path, override=True)
@@ -83,6 +84,13 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# Older updaters leave Settings under sync/_update_payload/; promote to install root.
+try:
+    if promote_settings_from_payload():
+        logging.info("[Update] Promoted Tallylive_sync_settings.exe from _update_payload.")
+except Exception as e:
+    logging.warning(f"[Update] Settings promote skipped: {e}")
 
 if _cfg.get("supabase_using_service_role"):
     logging.info("Supabase client using baked-in service_role key for sync writes.")

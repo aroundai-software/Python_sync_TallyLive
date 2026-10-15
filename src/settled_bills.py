@@ -12,6 +12,7 @@ from xml.sax.saxutils import escape
 from supabase import create_client
 from .config import load_config
 from .tally_companies import get_company_details
+from .tally_timeouts import tally_http_timeout
 
 
 # =====================================================
@@ -116,7 +117,7 @@ def fetch_lpp_for_ledger(tally_url: str, company_name: str, ledger_name: str) ->
         tally_url,
         data=xml_req.encode("utf-8"),
         headers={"Content-Type": "application/xml", "Connection": "close"},
-        timeout=45
+        timeout=tally_http_timeout(local_read=45, remote_read=180),
     )
     resp.raise_for_status()
     body = decode_response(resp)
@@ -253,7 +254,7 @@ def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int)
                 tally_url,
                 data=xml_request.encode("utf-8"),
                 headers={"Content-Type": "application/xml", "Connection": "close"},
-                timeout=45
+                timeout=tally_http_timeout(local_read=45, remote_read=180),
             )
             response.raise_for_status()
             xml_content = clean_tally_xml(decode_response(response))

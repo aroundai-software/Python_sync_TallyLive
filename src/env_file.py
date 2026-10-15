@@ -6,7 +6,7 @@ import os
 import re
 from typing import Dict
 
-from .paths import get_env_path
+from .paths import ensure_writable_env_path, get_env_path
 
 ENV_KEYS = ("TALLY_HOST", "TALLY_PORT", "SYNC_INTERVAL", "FULL_RECONCILE")
 
@@ -36,7 +36,7 @@ def read_env(path: str | None = None) -> Dict[str, str]:
 
 def write_env(values: Dict[str, str], path: str | None = None) -> str:
     """Write known keys; preserve other lines when file already exists."""
-    path = path or get_env_path()
+    path = path or ensure_writable_env_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     incoming = {k: str(values.get(k, "")).strip() for k in ENV_KEYS}

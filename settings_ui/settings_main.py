@@ -15,29 +15,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.env_file import read_env, write_env  # noqa: E402
+from src.paths import ensure_writable_env_path, get_env_path  # noqa: E402
 from src.version import APP_NAME, APP_VERSION  # noqa: E402
-
-
-def resolve_env_path() -> str:
-    """Find .env next to settings EXE or under Tallylive_python_sync_background."""
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = _ROOT
-
-    candidates = [
-        os.path.join(base, ".env"),
-        os.path.join(base, "Tallylive_python_sync_background", ".env"),
-        os.path.join(os.path.dirname(base), "Tallylive_python_sync_background", ".env"),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    # Default write location when installed beside sync folder
-    preferred = os.path.join(base, "Tallylive_python_sync_background", ".env")
-    if os.path.isdir(os.path.dirname(preferred)):
-        return preferred
-    return os.path.join(base, ".env")
 
 
 class SettingsApp(tk.Tk):
@@ -45,7 +24,8 @@ class SettingsApp(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME} Settings")
         self.resizable(False, False)
-        self.env_path = resolve_env_path()
+        # Read from active .env (config dir or legacy install path)
+        self.env_path = get_env_path()
         self.values = read_env(self.env_path)
 
         pad = {"padx": 12, "pady": 6}
@@ -115,6 +95,8 @@ class SettingsApp(tk.Tk):
             return
 
         try:
+            # Same folder as sync EXE (Program Files\...\Tallylive_python_sync_background\.env)
+            self.env_path = ensure_writable_env_path()
             write_env(
                 {
                     "TALLY_HOST": host,
@@ -128,13 +110,15 @@ class SettingsApp(tk.Tk):
             messagebox.showerror(
                 "Save failed",
                 f"Could not write settings.\n\n{e}\n\n"
-                "Try running Settings as Administrator if the install folder is protected.",
+                "The install folder is protected. Right-click Settings → "
+                "Run as administrator, then Save again.",
             )
             return
 
         messagebox.showinfo(
             "Saved",
-            "Settings saved.\nChanges apply on the next sync cycle.",
+            f"Settings saved to:\n{self.env_path}\n\n"
+            "Changes apply on the next sync cycle.",
         )
 
 

@@ -160,10 +160,19 @@ def build():
                 zipf.write(abs_path, rel_path)
     print(f"[OK] {zip_path}")
 
-    # Auto-update zip (sync folder only — no .env/data)
+    # Auto-update zip: single top-level sync folder (required by older updaters).
+    # Settings is nested under _update_payload/ so extract succeeds; sync/updater
+    # then copies it to the install root beside the sync folder.
     print("\n--- Creating auto-update zip ---")
     if os.path.isfile(update_zip):
         os.remove(update_zip)
+    settings_name = "Tallylive_sync_settings.exe"
+    settings_src = os.path.join(deployment_dir, settings_name)
+    payload_dir = os.path.join(target_sync, "_update_payload")
+    if os.path.isfile(settings_src):
+        os.makedirs(payload_dir, exist_ok=True)
+        shutil.copy2(settings_src, os.path.join(payload_dir, settings_name))
+        print(f"[OK] Staged {settings_name} under sync/_update_payload for update zip")
     with zipfile.ZipFile(update_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(target_sync):
             # skip runtime junk if present
@@ -175,6 +184,9 @@ def build():
                 # Zip with top-level folder name for updater strip logic
                 rel_inside = os.path.relpath(abs_path, deployment_dir)
                 zipf.write(abs_path, rel_inside.replace("\\", "/"))
+    # Keep deployment tree clean for Inno (settings stays at install root only)
+    if os.path.isdir(payload_dir):
+        shutil.rmtree(payload_dir, ignore_errors=True)
     digest = _sha256(update_zip)
     # Version is in the zip filename, e.g. Tallylive_python_sync_background_1.1.1.zip
     zip_basename = os.path.basename(update_zip)

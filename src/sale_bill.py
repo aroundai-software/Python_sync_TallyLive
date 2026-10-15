@@ -19,6 +19,7 @@ from .source_values import (
     reconcile_from_id,
     source_number,
 )
+from .tally_timeouts import tally_http_timeout
 
 
 # =====================================================
@@ -131,7 +132,7 @@ def get_tax_ledgers(company_name: str):
             config["tally_url"],
             data=xml_request.encode("utf-8"),
             headers={"Content-Type": "application/xml"},
-            timeout=60
+            timeout=tally_http_timeout(local_read=60, remote_read=180),
         )
         response.raise_for_status()
         return gst_names_xml(decode_response(response))
@@ -301,7 +302,7 @@ def get_sale_bills(company_name: str = None):
                 tally_url,
                 data=xml_request.encode("utf-8"),
                 headers={"Content-Type": "application/xml", "Connection": "close"},
-                timeout=180
+                timeout=tally_http_timeout(local_read=180, remote_read=300),
             )
             response.raise_for_status()
             
@@ -490,7 +491,7 @@ def reconcile_deleted_sale_bills(company_name: str) -> int:
             tally_url,
             data=xml_request.encode("utf-8"),
             headers={"Content-Type": "application/xml", "Connection": "close"},
-            timeout=120
+            timeout=tally_http_timeout(local_read=120, remote_read=240),
         )
         response.raise_for_status()
         xml_content = clean_tally_xml(decode_response(response))

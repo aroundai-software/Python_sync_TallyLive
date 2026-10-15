@@ -984,6 +984,30 @@ def push_local_table_to_supabase(
                         f'AND (_sync_error LIKE ? OR _sync_error LIKE ?)',
                         ("%57014%", "%statement timeout%"),
                     )
+            # After DB unique constraint is applied, retry prior ON CONFLICT failures
+            if company_name:
+                _conn.execute(
+                    f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                    f'WHERE {_exact_company_clause()} AND _sync_status = "failed" '
+                    f'AND (_sync_error LIKE ? OR _sync_error LIKE ? OR _sync_error LIKE ?)',
+                    (
+                        company_name,
+                        "%ON CONFLICT%",
+                        "%42P10%",
+                        "%no unique or exclusion constraint%",
+                    ),
+                )
+            else:
+                _conn.execute(
+                    f'UPDATE "{supabase_table}" SET _sync_status = "pending", _sync_error = NULL '
+                    f'WHERE _sync_status = "failed" '
+                    f'AND (_sync_error LIKE ? OR _sync_error LIKE ? OR _sync_error LIKE ?)',
+                    (
+                        "%ON CONFLICT%",
+                        "%42P10%",
+                        "%no unique or exclusion constraint%",
+                    ),
+                )
         _conn.close()
     except Exception as repend_err:
         logging.warning(f"[LocalDB] Could not re-pend retryable {supabase_table}: {repend_err}")
