@@ -24,8 +24,8 @@ class SettingsApp(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME} Settings")
         self.resizable(False, False)
-        # Read from active .env (config dir or legacy install path)
-        self.env_path = get_env_path()
+        # Always the sync-folder .env (migrate from install-root / ProgramData if needed)
+        self.env_path = ensure_writable_env_path()
         self.values = read_env(self.env_path)
 
         pad = {"padx": 12, "pady": 6}

@@ -57,22 +57,22 @@ create policy "sync_releases_select_anon"
 
 -- Upload new zips via Dashboard (or service role). Do not allow anon INSERT.
 
--- 5) After uploading a zip, activate / refresh a release row, e.g. 1.2.1:
---    Zip: installer_output/Tallylive_python_sync_background_1.2.1.zip
---    Storage: sync-releases/1.2.1/Tallylive_python_sync_background_1.2.1.zip
+-- 5) After uploading a zip, activate / refresh a release row, e.g. 1.2.2:
+--    Zip: installer_output/Tallylive_python_sync_background_1.2.2.zip
+--    Storage: sync-releases/1.2.2/Tallylive_python_sync_background_1.2.2.zip
 --
 -- Single top-level sync folder; Settings is inside
 --   Tallylive_python_sync_background/_update_payload/Tallylive_sync_settings.exe
--- (compatible with older updaters that only strip one top-level folder).
+-- Settings + sync share Tallylive_python_sync_background\.env
 --
-update public.sync_app_releases set is_active = false where version <> '1.2.1';
+update public.sync_app_releases set is_active = false where version <> '1.2.2';
 insert into public.sync_app_releases (version, storage_path, sha256, is_active, notes)
 values (
-  '1.2.1',
-  '1.2.1/Tallylive_python_sync_background_1.2.1.zip',
-  '08df4719b34df762a76467aacf78ca33bf2bc5001c85b998bfa697d5c3852357',
+  '1.2.2',
+  '1.2.2/Tallylive_python_sync_background_1.2.2.zip',
+  '<sha256 from build>',
   true,
-  'Settings via _update_payload (old-updater compatible); Program Files .env; P&L/timeouts'
+  'Settings saves .env into sync folder; _update_payload Settings; P&L/timeouts'
 )
 on conflict (version) do update set
   storage_path = excluded.storage_path,
