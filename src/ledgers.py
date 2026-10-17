@@ -509,8 +509,22 @@ def extract_customer_data(ledger, company_name):
 
     # ledger_type = parent group from Tally
     ledger_type = safe_text(ledger, "PARENT") or None
-    if ledger_type and ("charge" in ledger_type.lower() or "expense" in ledger_type.lower()):
-        ledger_type = "Indirect Expenses"
+    # Remap custom *charge*/*expense* parents to Indirect Expenses, but never
+    # collapse Tally's reserved Direct/Indirect P&L groups (e.g. Wage under Direct Expenses).
+    if ledger_type:
+        lt_lower = ledger_type.lower().strip()
+        _reserved_pnl = {
+            "direct expenses",
+            "indirect expenses",
+            "direct incomes",
+            "indirect incomes",
+            "sales accounts",
+            "purchase accounts",
+        }
+        if lt_lower not in _reserved_pnl and (
+            "charge" in lt_lower or "expense" in lt_lower
+        ):
+            ledger_type = "Indirect Expenses"
 
     # --- Alias ---
     alias = None

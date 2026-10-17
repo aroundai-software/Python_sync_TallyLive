@@ -1168,8 +1168,20 @@ def _last_reports_synced_local(company_guid: str) -> Optional[datetime]:
                 )
                 if not cur.fetchone():
                     return None
+                cols = {
+                    r[1].lower()
+                    for r in conn.execute(f'PRAGMA table_info("{reports_table}")').fetchall()
+                }
+                # Prefer business synced_at; fall back to local staging stamp.
+                ts_col = (
+                    "synced_at"
+                    if "synced_at" in cols
+                    else ("_synced_at" if "_synced_at" in cols else None)
+                )
+                if not ts_col or "company_name" not in cols:
+                    return None
                 row = conn.execute(
-                    f'SELECT synced_at, company_name FROM "{reports_table}" '
+                    f'SELECT "{ts_col}" AS synced_at, company_name FROM "{reports_table}" '
                     f'WHERE company_guid = ? OR guid = ? LIMIT 1',
                     (guid, guid),
                 ).fetchone()

@@ -33,6 +33,9 @@ TABLE_MAP = {
     "balance_sheet_lines": "balance_sheet_lines",
     "profit_loss_reports": "profit_loss_reports",
     "profit_loss_lines": "profit_loss_lines",
+    "tally_ratio_analysis": "tally_ratio_analysis",
+    "ratio_analysis": "tally_ratio_analysis",
+    "tally_cash_flow": "tally_cash_flow",
 }
 
 ALL_TABLES = [
@@ -53,6 +56,8 @@ ALL_TABLES = [
     "balance_sheet_lines",
     "profit_loss_reports",
     "profit_loss_lines",
+    "tally_ratio_analysis",
+    "tally_cash_flow",
 ]
 
 # Full-replace snapshots: wipe company rows before staging a new extract.
@@ -63,6 +68,8 @@ SNAPSHOT_TABLES = {
     "balance_sheet_lines",
     "profit_loss_reports",
     "profit_loss_lines",
+    "tally_ratio_analysis",
+    "tally_cash_flow",
 }
 
 # Parent report + child lines (pushed together; lines table skipped in generic loop).
@@ -1164,6 +1171,31 @@ def push_local_table_to_supabase(
                 if supabase_table == "tally_companies" and not (rec.get("company_name") or "").strip():
                     continue
 
+                if supabase_table == "tally_ratio_analysis":
+                    # Local PK uses guid (= company_guid); cloud unique is company_guid.
+                    rec.pop("guid", None)
+                    rec.pop("id", None)
+                    ratios = rec.get("ratios")
+                    if isinstance(ratios, str):
+                        try:
+                            rec["ratios"] = json.loads(ratios) if ratios.strip() else {}
+                        except Exception:
+                            rec["ratios"] = {}
+                    elif ratios is None:
+                        rec["ratios"] = {}
+
+                if supabase_table == "tally_cash_flow":
+                    rec.pop("guid", None)
+                    rec.pop("id", None)
+                    months = rec.get("months")
+                    if isinstance(months, str):
+                        try:
+                            rec["months"] = json.loads(months) if months.strip() else []
+                        except Exception:
+                            rec["months"] = []
+                    elif months is None:
+                        rec["months"] = []
+
                 upload_batch.append(_coerce_record_types(rec, supabase_table))
                 valid_guids.append(g)
             return upload_batch, valid_guids, missing_parent_guids
@@ -1207,11 +1239,15 @@ def push_local_table_to_supabase(
                 last_error = f"{supabase_table}: no uploadable rows in pending batch"
             break
 
-        conflict_target = (
-            COMPANY_MASTER_CONFLICT
-            if supabase_table == "tally_companies"
-            else COMPOSITE_CONFLICT
-        )
+        if supabase_table == "tally_companies":
+            conflict_target = COMPANY_MASTER_CONFLICT
+        elif supabase_table == "tally_ratio_analysis":
+            conflict_target = "company_guid"
+        elif supabase_table == "tally_cash_flow":
+            # One snapshot per company; upsert by name so GUID truncations cannot fork rows.
+            conflict_target = "company_name"
+        else:
+            conflict_target = COMPOSITE_CONFLICT
 
         try:
             supabase.table(supabase_table).upsert(

@@ -64,6 +64,8 @@ import src.godowns as godowns
 import src.cost_centers as cost_centers
 import src.settled_bills as settled_bills
 import src.financial_reports as financial_reports
+import src.ratio_analysis as ratio_analysis
+import src.cash_flow as cash_flow
 from src.tally_client import TallyClient
 
 # Log next to the EXE (same folder as .env)
@@ -272,8 +274,8 @@ def run_sync_cycle():
             company_name = company_data.get("company_name", "Unknown")
             logging.info(f"\n--- [Company {comp_idx}/{len(all_companies)}] Starting Sync for: {company_name} ---")
             
-            # Initialize logger for this company (14 steps; includes financial reports)
-            logger = SyncLogger(total_steps=14)
+            # Initialize logger for this company (16 steps; FR + Ratio + Cash Flow)
+            logger = SyncLogger(total_steps=16)
             logger.start()
             logger.set_company_name(company_name)
 
@@ -287,7 +289,7 @@ def run_sync_cycle():
                     continue
 
                 logging.info(f"[OK] Connected to Tally Company: {company_name}")
-                print(f"\n [{comp_idx}/{len(all_companies)}] [1/14] Synced Company: {company_name}\n")
+                print(f"\n [{comp_idx}/{len(all_companies)}] [1/16] Synced Company: {company_name}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -304,7 +306,7 @@ def run_sync_cycle():
                 del_count = ledgers.reconcile_deleted_customers(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} customers/suppliers{del_msg} for {company_name}")
-                print(f" [2/14] Synced {count} Customers & Suppliers{del_msg}\n")
+                print(f" [2/16] Synced {count} Customers & Suppliers{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -319,7 +321,7 @@ def run_sync_cycle():
                 del_count = godowns.reconcile_deleted_godowns(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} godowns{del_msg} for {company_name}")
-                print(f" [3/14] Synced {count} Godowns{del_msg}\n")
+                print(f" [3/16] Synced {count} Godowns{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -334,7 +336,7 @@ def run_sync_cycle():
                 del_count = cost_centers.reconcile_deleted_cost_centers(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} cost centers{del_msg} for {company_name}")
-                print(f" [4/14] Synced {count} Cost Centers{del_msg}\n")
+                print(f" [4/16] Synced {count} Cost Centers{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -354,7 +356,7 @@ def run_sync_cycle():
                 del_count = stock_items.reconcile_deleted_stock_items(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} stock items{del_msg} for {company_name}")
-                print(f" [5/14] Synced {count} Stock Items{del_msg}\n")
+                print(f" [5/16] Synced {count} Stock Items{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -366,7 +368,7 @@ def run_sync_cycle():
                 except Exception as bal_err:
                     logging.warning(f"[StockItems] Recovery balance refresh also failed: {bal_err}")
                 logger.step_failed(f"Stock items sync failed: {format_error(e)}")
-                print(f" [5/14] ERROR Stock Items sync failed: {e}\n")
+                print(f" [5/16] ERROR Stock Items sync failed: {e}\n")
             # 6. Sale Bills
             try:
                 sale_bills_data = sale_bill.get_sale_bills(company_name)
@@ -375,7 +377,7 @@ def run_sync_cycle():
                 del_count = sale_bill.reconcile_deleted_sale_bills(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} sale bills{del_msg} for {company_name}")
-                print(f" [6/14] Synced {count} Sale Bills{del_msg}\n")
+                print(f" [6/16] Synced {count} Sale Bills{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -387,7 +389,7 @@ def run_sync_cycle():
                 saved_count = sale_bill_item.save_sale_bill_items_to_supabase(sale_bill_items_data, company_name)
                 count = saved_count if saved_count > 0 else (len(sale_bill_items_data) if sale_bill_items_data else 0)
                 logging.info(f"Synced {count} sale bill items for {company_name}")
-                print(f" [7/14] Synced {count} Sale Bill Items\n")
+                print(f" [7/16] Synced {count} Sale Bill Items\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -401,12 +403,12 @@ def run_sync_cycle():
                 del_count = purchase_bill.reconcile_deleted_purchase_bills(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} purchase bills{del_msg} for {company_name}")
-                print(f" [8/14] Synced {count} Purchase Bills{del_msg}\n")
+                print(f" [8/16] Synced {count} Purchase Bills{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
                 logging.error(f"Purchase bills sync failed for {company_name}: {e}")
-                print(f" [8/14] ERROR Purchase Bills sync failed: {e}\n")
+                print(f" [8/16] ERROR Purchase Bills sync failed: {e}\n")
                 logger.step_failed(f"Purchase bills sync failed: {format_error(e)}")
 
             # 9. Purchase Bill Items
@@ -415,7 +417,7 @@ def run_sync_cycle():
                 saved_count = purchase_bill_item.save_purchase_bill_items_to_supabase(purchase_bill_items_data, company_name)
                 count = saved_count if saved_count > 0 else (len(purchase_bill_items_data) if purchase_bill_items_data else 0)
                 logging.info(f"Synced {count} purchase bill items for {company_name}")
-                print(f" [9/14] Synced {count} Purchase Bill Items\n")
+                print(f" [9/16] Synced {count} Purchase Bill Items\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -442,7 +444,7 @@ def run_sync_cycle():
                     f"(pending={sales_status.get('pending', 0)}, paid={sales_status.get('paid', 0)})"
                 )
                 print(
-                    f" [10/14] Synced {count} Outstanding Receivables "
+                    f" [10/16] Synced {count} Outstanding Receivables "
                     f"(sales Pending={sales_status.get('pending', 0)}, "
                     f"Paid={sales_status.get('paid', 0)})\n"
                 )
@@ -472,7 +474,7 @@ def run_sync_cycle():
                     f"(pending={purchase_status.get('pending', 0)}, paid={purchase_status.get('paid', 0)})"
                 )
                 print(
-                    f" [11/14] Synced {count} Outstanding Payables "
+                    f" [11/16] Synced {count} Outstanding Payables "
                     f"(purchases Pending={purchase_status.get('pending', 0)}, "
                     f"Paid={purchase_status.get('paid', 0)})\n"
                 )
@@ -489,7 +491,7 @@ def run_sync_cycle():
                 del_count = daybook.reconcile_deleted_daybook(company_name)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} daybook entries{del_msg} for {company_name}")
-                print(f" [12/14] Synced {count} Daybook Entries{del_msg}\n")
+                print(f" [12/16] Synced {count} Daybook Entries{del_msg}\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -497,11 +499,11 @@ def run_sync_cycle():
 
             # 13. Settled Bills
             try:
-                print(f" [13/14] Syncing Settled Bills for {company_name}...\n")
+                print(f" [13/16] Syncing Settled Bills for {company_name}...\n")
                 count = settled_bills.sync_settled_bills(company_name)
                 count = count if count is not None else 0
                 logging.info(f"Synced {count} settled bills for {company_name}")
-                print(f" [13/14] Synced {count} Settled Bills\n")
+                print(f" [13/16] Synced {count} Settled Bills\n")
                 logger.step_passed()
                 time.sleep(0.1)
             except Exception as e:
@@ -555,7 +557,7 @@ def run_sync_cycle():
                 for err in push_errors:
                     logger.note_error(f"Phase 3: {err}")
                 
-                # Pending FR snapshots are handled in step 14 after this push —
+                # Pending FR snapshots are handled in step 14+ after this push —
                 # do not mark core upload failed solely for those tables.
                 from src.local_db import (
                     FINANCIAL_REPORT_HEADER_TABLES,
@@ -585,7 +587,7 @@ def run_sync_cycle():
                     if fr_pending:
                         logging.info(
                             f"[INFO] {fr_pending} financial-report row(s) still pending "
-                            f"(step 14 will refresh/push when due)"
+                            f"(step 14+ will refresh/push when due)"
                         )
                 else:
                     upload_failed = True
@@ -609,7 +611,7 @@ def run_sync_cycle():
             # FR timeout/defer is non-fatal: note_error + step_passed so core sync
             # stays "completed" when books data uploaded successfully.
             try:
-                print(f" [14/14] Financial reports (BS/P&L) for {company_name}...\n")
+                print(f" [14/16] Financial reports (BS/P&L) for {company_name}...\n")
                 fr = financial_reports.sync_financial_reports(
                     company_name=company_name,
                     company_guid=company_data.get("guid"),
@@ -622,9 +624,9 @@ def run_sync_cycle():
                 if fr_status in ("skipped", "deferred"):
                     reason = fr.get("reason") or fr_status
                     logging.info(
-                        f"[14/14] Financial reports {fr_status} for {company_name} ({reason})"
+                        f"[14/16] Financial reports {fr_status} for {company_name} ({reason})"
                     )
-                    print(f" [14/14] Financial reports {fr_status} ({reason})\n")
+                    print(f" [14/16] Financial reports {fr_status} ({reason})\n")
                     if fr_status == "deferred":
                         logger.note_error(f"FR deferred: {reason}")
                 elif fr_status == "failed":
@@ -633,8 +635,8 @@ def run_sync_cycle():
                     detail = f"FR warning: {reason}"
                     if retry:
                         detail += f" (next retry after {retry})"
-                    logging.warning(f"[14/14] {detail}")
-                    print(f" [14/14] Financial reports deferred/failed (non-fatal)\n")
+                    logging.warning(f"[14/16] {detail}")
+                    print(f" [14/16] Financial reports deferred/failed (non-fatal)\n")
                     logger.note_error(detail)
                 else:
                     bs_n = fr.get("bs_line_count", 0)
@@ -644,7 +646,7 @@ def run_sync_cycle():
                         f"BS={bs_n} lines, P&L={pl_n} lines (local DB)"
                     )
                     print(
-                        f" [14/14] Staged Financial Reports locally "
+                        f" [14/16] Staged Financial Reports locally "
                         f"(BS={bs_n}, P&L={pl_n})\n"
                     )
                     # Push FR snapshots now (staged after Phase 3 core upload).
@@ -675,9 +677,52 @@ def run_sync_cycle():
                     f"FR warning: {format_error(e)}"
                 )
                 logging.warning(
-                    f"[14/14] Financial reports unexpected error (non-fatal): {e}"
+                    f"[14/16] Financial reports unexpected error (non-fatal): {e}"
                 )
-                print(f" [14/14] Financial reports warning (non-fatal)\n")
+                print(f" [14/16] Financial reports warning (non-fatal)\n")
+                logger.step_passed()
+
+            # 15. Ratio Analysis (FY start → today) — lightweight; non-fatal.
+            try:
+                print(f" [15/16] Ratio Analysis for {company_name}...\n")
+                ra = ratio_analysis.sync_ratio_analysis(
+                    company_name=company_name,
+                    company_guid=company_data.get("guid") or "",
+                )
+                days = ra.get("recv_turnover_days")
+                print(
+                    f" [15/16] Recv. Turnover in days = {days} "
+                    f"({ra.get('from_date')} → {ra.get('to_date')})\n"
+                )
+                logger.step_passed()
+            except Exception as e:
+                logging.warning(
+                    f"Ratio Analysis sync skipped for {company_name}: {format_error(e)}"
+                )
+                print(f" [15/16] Ratio Analysis warning (non-fatal)\n")
+                logger.note_error(f"Ratio warning: {format_error(e)}")
+                logger.step_passed()
+
+            # 16. Cash Flow monthly (FY start → today) — lightweight; non-fatal.
+            try:
+                print(f" [16/16] Cash Flow for {company_name}...\n")
+                cf = cash_flow.sync_cash_flow(
+                    company_name=company_name,
+                    company_guid=company_data.get("guid") or "",
+                )
+                print(
+                    f" [16/16] Cash Flow {cf.get('month_count')} months "
+                    f"in={cf.get('total_inflow')} out={cf.get('total_outflow')} "
+                    f"nett={cf.get('total_nett')} "
+                    f"({cf.get('from_date')} → {cf.get('to_date')})\n"
+                )
+                logger.step_passed()
+            except Exception as e:
+                logging.warning(
+                    f"Cash Flow sync skipped for {company_name}: {format_error(e)}"
+                )
+                print(f" [16/16] Cash Flow warning (non-fatal)\n")
+                logger.note_error(f"Cash Flow warning: {format_error(e)}")
                 logger.step_passed()
 
             logger.finish(upload_failed=upload_failed, upload_error=upload_error)
