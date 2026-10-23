@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 from xml.sax.saxutils import escape
@@ -69,20 +70,54 @@ def fetch_ratio_analysis(
 <SVTODATE TYPE="Date">{_fmt_tally_date(to_date)}</SVTODATE>
 </STATICVARIABLES></DESC></BODY>
 </ENVELOPE>"""
-    timeout = tally_http_timeout(local_read=60, remote_read=120)
-    response = requests.post(
-        config["tally_url"],
-        data=xml.encode("utf-8"),
-        headers={"Content-Type": "application/xml", "Connection": "close"},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    text = decode_response(response)
-    if "LINEERROR" in text:
-        m = re.search(r"<LINEERROR>(.*?)</LINEERROR>", text, re.I | re.S)
+    # Local used to be a single 60s try. Busy or Educational Tally often needs
+    # longer, and "could not be setup" clears on a second attempt.
+    timeout = tally_http_timeout(local_read=180, remote_read=180)
+    retries = 2
+    last_err: Optional[Exception] = None
+    text = ""
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(
+                f"Ratio Analysis for {company_name} attempt {attempt}/{retries}..."
+            )
+            response = requests.post(
+                config["tally_url"],
+                data=xml.encode("utf-8"),
+                headers={"Content-Type": "application/xml", "Connection": "close"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            text = decode_response(response)
+            if "LINEERROR" in text:
+                m = re.search(r"<LINEERROR>(.*?)</LINEERROR>", text, re.I | re.S)
+                message = re.sub(
+                    r"\s+", " ", (m.group(1) if m else "Ratio Analysis failed")
+                ).strip()
+                err = RuntimeError(message)
+                # Tally was busy or the report engine was not ready. Retry once.
+                if "could not be setup" in message.lower() and attempt < retries:
+                    last_err = err
+                    logger.warning(
+                        f"Ratio Analysis attempt {attempt}/{retries} for {company_name}: {message}"
+                    )
+                    time.sleep(5 * attempt)
+                    continue
+                raise err
+            last_err = None
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            logger.warning(
+                f"Ratio Analysis attempt {attempt}/{retries} for {company_name} "
+                f"timed out/unreachable: {e}"
+            )
+            if attempt < retries:
+                time.sleep(5 * attempt)
+    if last_err is not None:
         raise RuntimeError(
-            re.sub(r"\s+", " ", (m.group(1) if m else "Ratio Analysis failed")).strip()
-        )
+            f"Ratio Analysis failed after {retries} attempt(s): {last_err}"
+        ) from last_err
 
     pairs = re.findall(
         r"<RATIONAME>(.*?)</RATIONAME>\s*<RATIOVALUE>(.*?)</RATIOVALUE>",
