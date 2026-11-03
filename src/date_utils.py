@@ -74,6 +74,121 @@ def get_current_fy_monthly_date_ranges():
 
     return ranges
 
+
+def tally_ymd_to_iso(ymd):
+    """Convert Tally YYYYMMDD (or ISO) to YYYY-MM-DD. Empty if unusable."""
+    text = str(ymd or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return ""
+
+
+def iso_window_from_tally_ranges(date_ranges):
+    """
+    Inclusive ISO date window covering the first chunk start through the last chunk end.
+    Used so reconcile only deletes vouchers inside the same window Tally was asked for.
+    """
+    if not date_ranges:
+        return "", ""
+    start = tally_ymd_to_iso(date_ranges[0][0])
+    end = tally_ymd_to_iso(date_ranges[-1][1])
+    return start, end
+
+
+def company_period_start(as_on=None, books_from_iso=None):
+    """
+    Period start for this Tally company: its books_from when known.
+    SYNC_START_YEAR still pins a single Indian FY (explicit override).
+    Otherwise fall back to the current Indian FY (1 April).
+    """
+    from datetime import date as date_cls
+
+    if as_on is None:
+        as_on = date_cls.today()
+    elif isinstance(as_on, datetime):
+        as_on = as_on.date()
+
+    load_dotenv(override=True)
+    custom_year = os.environ.get("SYNC_START_YEAR", "").strip()
+    if custom_year and custom_year.isdigit():
+        return date_cls(int(custom_year), 4, 1)
+
+    iso = tally_ymd_to_iso(books_from_iso) if books_from_iso else ""
+    if iso:
+        try:
+            return date_cls.fromisoformat(iso)
+        except Exception:
+            pass
+
+    if as_on.month >= 4:
+        return date_cls(as_on.year, 4, 1)
+    return date_cls(as_on.year - 1, 4, 1)
+
+
+def indian_fy_end_for(start):
+    """
+    Last day of the Indian financial year that contains ``start``.
+    Apr–Mar FY: 2024-04-01 → 2025-03-31; 2025-01-15 → 2025-03-31.
+    """
+    from datetime import date as date_cls
+
+    if isinstance(start, datetime):
+        start = start.date()
+    if start.month >= 4:
+        return date_cls(start.year + 1, 3, 31)
+    return date_cls(start.year, 3, 31)
+
+
+def company_period_bounds(as_on=None, books_from_iso=None):
+    """
+    Report window for this company: period start → min(today, that FY end).
+
+    Does not use the company name. Examples:
+      books_from 2024-04-01, today 2026-11-03 → 2024-04-01 … 2025-03-31
+      books_from 2026-04-01, today 2026-11-03 → 2026-04-01 … 2026-11-03
+      books_from missing, today 2026-11-03 → 2026-04-01 … 2026-11-03
+    """
+    from datetime import date as date_cls
+
+    if as_on is None:
+        as_on = date_cls.today()
+    elif isinstance(as_on, datetime):
+        as_on = as_on.date()
+
+    start = company_period_start(as_on, books_from_iso)
+    end = min(as_on, indian_fy_end_for(start))
+    if end < start:
+        end = start
+    return start, end
+
+
+def get_company_voucher_date_ranges(books_from_iso=None):
+    """
+    Monthly YYYYMMDD chunks covering this company's books through today.
+
+    SYNC_START_YEAR pins one Indian FY for every company.
+    Else start at books_from (month start) through the current month.
+    If books_from is missing, use the current Indian FY (previous default).
+    """
+    load_dotenv(override=True)
+    custom_year = os.environ.get("SYNC_START_YEAR", "").strip()
+    if custom_year and custom_year.isdigit():
+        return get_current_fy_monthly_date_ranges()
+    if books_from_iso and tally_ymd_to_iso(books_from_iso):
+        return get_monthly_date_ranges(tally_ymd_to_iso(books_from_iso))
+    return get_current_fy_monthly_date_ranges()
+
+
+def get_company_item_fetch_window(books_from_iso=None):
+    """Single Tally date window spanning the company's voucher ranges (line items)."""
+    months = get_company_voucher_date_ranges(books_from_iso)
+    if not months:
+        return []
+    return [(months[0][0], months[-1][1])]
+
 def get_current_fy_item_date_ranges(days_per_chunk=7):
     """
     Returns smaller date chunks (default 7 days) across the financial year

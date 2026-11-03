@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import re
 import requests
 import time
@@ -156,7 +156,7 @@ def resolve_tax(entry, quantity, unit_price):
 # FETCH TALLY
 # =====================================================
 
-def get_sale_bill_items(company_name: str = None):
+def get_sale_bill_items(company_name: str = None, books_from_iso: str = None):
     config = load_config()
     tally_url = config["tally_url"]
     supabase = create_client(config["supabase_url"], config["supabase_key"])
@@ -194,15 +194,17 @@ def get_sale_bill_items(company_name: str = None):
     # Tally often ignores small SV date windows and returns the same voucher set
     # every chunk (we saw identical 1162-item stages 14 times). A single
     # current-FY request is correct and far faster.
-    from .date_utils import get_current_fy_monthly_date_ranges
-    _months = get_current_fy_monthly_date_ranges()
-    date_ranges = [(_months[0][0], _months[-1][1])] if _months else []
+    from .date_utils import get_company_item_fetch_window
+    date_ranges = get_company_item_fetch_window(books_from_iso)
 
     # Determine checkpoint locally from SQLite
     max_alter_id = reconcile_from_id(get_max_alter_id_local("invoice_items", company_name))
     logging.info(f"Sale items incremental sync from alter_id > {max_alter_id}")
     
-    logging.info(f"Fetching sale bill items for FY window {date_ranges[0][0]}-{date_ranges[0][1]}...")
+    logging.info(
+        f"Fetching sale bill items for books window {date_ranges[0][0]}-{date_ranges[0][1]}..."
+        if date_ranges else "Fetching sale bill items (no date window)..."
+    )
     
     items_list = []
     skipped_no_bill = 0

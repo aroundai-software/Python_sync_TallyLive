@@ -253,12 +253,25 @@ def fetch_all_customers(supabase, company_name: str = None):
 # TALLY FETCH
 # =====================================================
 
-def get_outstanding_payables(company_name: str = None):
+def get_outstanding_payables(company_name: str = None, books_from_iso: str = None):
     if not company_name:
         company_details = get_company_details()
         company_name = company_details.get("company_name", "")
 
-    today_str = datetime.now().strftime("%Y%m%d")
+    # Bill collections reject dates before books begin on many year-company files.
+    # Use books_from → today (not FY-capped report bounds) so open bills stay visible.
+    from datetime import date as date_cls
+    from .date_utils import company_period_start
+    from_d = company_period_start(books_from_iso=books_from_iso)
+    to_d = date_cls.today()
+    if to_d < from_d:
+        to_d = from_d
+    from_str = from_d.strftime("%Y%m%d")
+    to_str = to_d.strftime("%Y%m%d")
+    logging.info(
+        f"Outstanding payables window {from_str}..{to_str} "
+        f"(books_from={books_from_iso or 'current FY'})"
+    )
 
     xml_request = f"""
 <ENVELOPE>
@@ -276,8 +289,8 @@ def get_outstanding_payables(company_name: str = None):
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
                 <SVCURRENTCOMPANY>{escape(company_name)}</SVCURRENTCOMPANY>
-                <SVFROMDATE TYPE="Date">19000101</SVFROMDATE>
-                <SVTODATE TYPE="Date">{today_str}</SVTODATE>
+                <SVFROMDATE TYPE="Date">{from_str}</SVFROMDATE>
+                <SVTODATE TYPE="Date">{to_str}</SVTODATE>
             </STATICVARIABLES>
 
             <TDL>
@@ -570,14 +583,18 @@ def get_outstanding_payables(company_name: str = None):
 # =====================================================
 
 def save_outstanding_payables_to_supabase(outstandings, company_name=None):
-    from .local_db import save_to_local_db
+    from .local_db import save_to_local_db, clear_snapshot_for_company
     if not company_name and outstandings:
         company_name = outstandings[0].get("company_name", "")
     if outstandings:
         staged = save_to_local_db("outstanding_payables", outstandings, company_name or "")
         logging.info(f"[LocalDB] Staged {staged} outstanding payables locally in sync_cache.db")
         return staged
-    logging.info("No outstanding payables to save.")
+    if company_name:
+        clear_snapshot_for_company("outstanding_payables", company_name)
+        logging.info(f"Cleared outstanding payables snapshot for {company_name} (Tally empty).")
+    else:
+        logging.info("No outstanding payables to save.")
     return 0
 
 

@@ -243,6 +243,8 @@ def month_date_range(
     candidates = {from_date.year, to_date.year}
     for y in range(from_date.year, to_date.year + 1):
         candidates.add(y)
+    # Prefer the earliest year inside the report window so a long
+    # books_from→today span does not map "April" to a later calendar year.
     best: Optional[tuple[date, date]] = None
     for year in sorted(candidates):
         last_day = calendar.monthrange(year, month_num)[1]
@@ -253,6 +255,7 @@ def month_date_range(
         start = max(start, from_date)
         end = min(end, to_date)
         best = (start, end)
+        break
     return best
 
 

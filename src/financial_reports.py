@@ -150,23 +150,9 @@ def _parse_amount(raw: Optional[str]) -> Optional[float]:
 
 
 def indian_fy_start(as_on: Optional[date] = None, books_from_iso: Optional[str] = None) -> date:
-    """
-    Report period start = current Indian FY (1 April), not older books_from years.
-    If books began after this FY start, use books_from (new company mid-year).
-    """
-    as_on = as_on or date.today()
-    if as_on.month >= 4:
-        fy = date(as_on.year, 4, 1)
-    else:
-        fy = date(as_on.year - 1, 4, 1)
-    if books_from_iso:
-        try:
-            bf = date.fromisoformat(str(books_from_iso)[:10])
-            if bf > fy:
-                return bf
-        except Exception:
-            pass
-    return fy
+    """Report period start is this company's books_from (or current Indian FY)."""
+    from .date_utils import company_period_start
+    return company_period_start(as_on, books_from_iso)
 
 
 def _classify_bs_section(name: str) -> str:
@@ -428,8 +414,9 @@ def fetch_balance_sheet(
     as_on: Optional[date] = None,
     books_from_iso: Optional[str] = None,
 ) -> ReportSnapshot:
-    as_on = as_on or date.today()
-    from_date = indian_fy_start(as_on, books_from_iso)
+    from .date_utils import company_period_bounds
+
+    from_date, as_on = company_period_bounds(as_on or date.today(), books_from_iso)
     xml_text = export_tally_report("Balance Sheet", company_name, from_date, as_on)
     lines = parse_balance_sheet_xml(xml_text)
     return ReportSnapshot(
@@ -448,8 +435,9 @@ def fetch_profit_and_loss(
     as_on: Optional[date] = None,
     books_from_iso: Optional[str] = None,
 ) -> ReportSnapshot:
-    as_on = as_on or date.today()
-    from_date = indian_fy_start(as_on, books_from_iso)
+    from .date_utils import company_period_bounds
+
+    from_date, as_on = company_period_bounds(as_on or date.today(), books_from_iso)
     xml_text = export_tally_report("Profit and Loss", company_name, from_date, as_on)
     lines = parse_profit_loss_xml(xml_text)
     return ReportSnapshot(
@@ -671,6 +659,7 @@ def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
         "guid": snapshot.company_guid,
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
+        "from_date": snapshot.from_date,
         "as_on_date": snapshot.to_date,
         "format": "condensed",
         "total_liabilities": round(liab, 2),
@@ -1573,8 +1562,10 @@ def run_spike(
     company = _resolve_company(company_name)
     name = company.get("company_name") or ""
     guid = company.get("guid") or ""
+    from .date_utils import company_period_bounds
+
     books_from = company.get("books_from") or company.get("financial_year_from")
-    as_on = as_on or date.today()
+    from_date, as_on = company_period_bounds(as_on or date.today(), books_from)
 
     root = Path(__file__).resolve().parents[1]
     out_dir = out_dir or (root / "data" / "financial_report_spike")
@@ -1583,13 +1574,13 @@ def run_spike(
     bs_xml = export_tally_report(
         "Balance Sheet",
         name,
-        indian_fy_start(as_on, books_from),
+        from_date,
         as_on,
     )
     pl_xml = export_tally_report(
         "Profit and Loss",
         name,
-        indian_fy_start(as_on, books_from),
+        from_date,
         as_on,
     )
 
@@ -1600,7 +1591,6 @@ def run_spike(
     bs_path.write_text(bs_xml, encoding="utf-8")
     pl_path.write_text(pl_xml, encoding="utf-8")
 
-    from_date = indian_fy_start(as_on, books_from)
     bs = ReportSnapshot(
         report_type="balance_sheet",
         company_name=name,

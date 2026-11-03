@@ -58,6 +58,38 @@ def get_text_or_none(value):
     return text if text else None
 
 
+def normalize_company_number(value):
+    """Blank and NULL company numbers are the same identity value."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def company_identity_key(company_data):
+    """
+    A company is the same row only when guid, company_name, and company_number
+    all match. Any one field different means a new company (do not overwrite).
+    """
+    if not isinstance(company_data, dict):
+        return ("", "", "")
+    return (
+        (company_data.get("guid") or "").strip(),
+        (company_data.get("company_name") or "").strip(),
+        normalize_company_number(company_data.get("company_number")),
+    )
+
+
+def apply_company_identity(company_data):
+    """Stamp normalized identity fields and never send a UUID that could rewrite another row."""
+    data = dict(company_data or {})
+    guid, name, number = company_identity_key(data)
+    data["guid"] = guid
+    data["company_name"] = name
+    data["company_number"] = number
+    data.pop("id", None)
+    return data
+
+
 def format_tally_date(value):
 
     value = get_text(value)
@@ -178,9 +210,9 @@ def extract_company_dict(company, base_currency_name=""):
     if base_currency_name:
         company = dict(company, BASECURRENCYMAILINGNAME=base_currency_name)
 
-    return {
+    return apply_company_identity({
         "company_name": get_text(company.get("NAME")),
-        "company_number": get_text_or_none(company.get("COMPANYNUMBER")),
+        "company_number": get_text(company.get("COMPANYNUMBER")),
         "guid": get_text(company.get("GUID")),
         "master_id": get_text_or_none(company.get("MASTERID")),
         "address_line1": address_parts[0] if len(address_parts) > 0 else None,
@@ -206,7 +238,7 @@ def extract_company_dict(company, base_currency_name=""):
         "is_active": True,
         "sync_enabled": True,
         "updated_at": datetime.now(timezone.utc).isoformat()
-    }
+    })
 
 def get_all_companies_details():
     xml_request = """
@@ -285,9 +317,17 @@ def get_company_details():
 
 def save_company_to_supabase(company_data):
     from .local_db import save_to_local_db
-    comp_name = company_data.get("company_name", "") if isinstance(company_data, dict) else ""
-    if company_data:
-        save_to_local_db("tally_companies", [company_data], comp_name)
+    if not company_data:
+        return True
+    company_data = apply_company_identity(company_data)
+    guid, name, number = company_identity_key(company_data)
+    if not guid or not name:
+        raise ValueError("Company guid and company_name are required")
+    logging.info(
+        f"Company identity guid={guid} name={name!r} number={number!r} "
+        f"(overwrite only if all three match an existing row)"
+    )
+    save_to_local_db("tally_companies", [company_data], name)
     return True
 
 

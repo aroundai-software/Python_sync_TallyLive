@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import re
 import requests
 import time
@@ -156,7 +156,7 @@ def resolve_tax(entry, quantity, unit_price):
 # FETCH TALLY
 # =====================================================
 
-def get_purchase_bill_items(company_name: str = None):
+def get_purchase_bill_items(company_name: str = None, books_from_iso: str = None):
     config = load_config()
     tally_url = config["tally_url"]
     supabase = create_client(config["supabase_url"], config["supabase_key"])
@@ -180,18 +180,17 @@ def get_purchase_bill_items(company_name: str = None):
     logging.info(f"Loaded {len(guid_to_invoice_id)} purchase_invoices for {company_name}")
 
     # One FY window — inventory FETCH makes small date chunks unreliable in Tally.
-    from .date_utils import get_current_fy_monthly_date_ranges
-    _months = get_current_fy_monthly_date_ranges()
-    date_ranges = [(_months[0][0], _months[-1][1])] if _months else []
+    from .date_utils import get_company_item_fetch_window
+    date_ranges = get_company_item_fetch_window(books_from_iso)
 
     # Determine checkpoint locally from SQLite
     max_alter_id = reconcile_from_id(get_max_alter_id_local("invoice_items_purchase", company_name))
     logging.info(f"Purchase items incremental sync from alter_id > {max_alter_id}")
-    
+
     logging.info(
-        f"Fetching purchase bill items for FY window "
+        f"Fetching purchase bill items for books window "
         f"{date_ranges[0][0]}-{date_ranges[0][1]}..."
-        if date_ranges else "Fetching purchase bill items (no FY window)..."
+        if date_ranges else "Fetching purchase bill items (no date window)..."
     )
     
     items_list = []

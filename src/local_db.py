@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -84,9 +85,35 @@ INTERNAL_COLS = {"_sync_status", "_synced_at", "_sync_error"}
 
 # All business sync tables are isolated by (company_name, guid).
 # tally_companies also stores company_name; local PK is composite for consistency.
-# Supabase upsert for tally_companies still conflicts on guid alone (company master).
+# Supabase upsert for tally_companies conflicts on (guid, company_name, company_number).
+# Any one of those three differing inserts a new company instead of rewriting.
 COMPOSITE_CONFLICT = "company_name,guid"
-COMPANY_MASTER_CONFLICT = "guid"
+COMPANY_MASTER_CONFLICT = "guid,company_name,company_number"
+# One financial snapshot per Tally year-company (name + GUID), not GUID alone.
+REPORT_SNAPSHOT_CONFLICT = "company_name,company_guid"
+
+# Reconcile may only delete rows whose date falls inside the Tally fetch window.
+RECONCILE_DATE_COLUMNS = {
+    "sales_invoices": "invoice_date",
+    "purchase_invoices": "invoice_date",
+    "tally_daybook": "date",
+}
+
+
+def _normalize_company_number(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _prepare_company_master_record(rec: dict) -> dict:
+    """Identity is guid + company_name + company_number. Never send id (would rewrite by UUID)."""
+    data = dict(rec or {})
+    data["guid"] = (data.get("guid") or "").strip()
+    data["company_name"] = (data.get("company_name") or "").strip()
+    data["company_number"] = _normalize_company_number(data.get("company_number"))
+    data.pop("id", None)
+    return data
 
 
 def _require_company_name(company_name: str, context: str = "") -> str:
@@ -292,7 +319,14 @@ def save_to_local_db(table_name: str, records: list, company_name: str = "") -> 
 
             rows_to_insert = []
             for r in records:
-                guid = r.get("guid") or r.get("Guid") or r.get("id")
+                if table_name == "tally_companies":
+                    r = _prepare_company_master_record(r)
+                    company_name = r.get("company_name") or company_name
+                    guid = r.get("guid")
+                    if not guid or not company_name:
+                        continue
+                else:
+                    guid = r.get("guid") or r.get("Guid") or r.get("id")
                 if not guid:
                     name_key = (
                         r.get("customer_name")
@@ -327,6 +361,51 @@ def save_to_local_db(table_name: str, records: list, company_name: str = "") -> 
         conn.close()
 
     return saved_count
+
+
+def clear_snapshot_for_company(table_name: str, company_name: str) -> int:
+    """
+    Clear a SNAPSHOT table for one company in local SQLite and Supabase.
+    Used when Tally returns an empty outstanding list (all settled).
+    """
+    table_name = TABLE_MAP.get(table_name, table_name)
+    if table_name not in SNAPSHOT_TABLES:
+        raise ValueError(f"{table_name} is not a snapshot table")
+    company_name = _require_company_name(company_name, f"clear:{table_name}")
+
+    deleted_local = 0
+    conn = get_connection()
+    try:
+        with conn:
+            cur = conn.execute(
+                f'SELECT name FROM sqlite_master WHERE type="table" AND name=?',
+                (table_name,),
+            )
+            if cur.fetchone():
+                cur = conn.execute(
+                    f'DELETE FROM "{table_name}" WHERE {_exact_company_clause()}',
+                    (company_name,),
+                )
+                deleted_local = cur.rowcount or 0
+    except Exception as e:
+        logging.error(f"[LocalDB] Failed clearing {table_name} for {company_name}: {e}")
+    finally:
+        conn.close()
+
+    try:
+        from .config import load_config
+        cfg = load_config()
+        from supabase import create_client
+        sb = create_client(cfg["supabase_url"], cfg["supabase_key"])
+        sb.table(table_name).delete().eq("company_name", company_name).execute()
+    except Exception as e:
+        logging.warning(f"[LocalDB] Cloud clear of {table_name} for {company_name} failed: {e}")
+
+    logging.info(
+        f"[LocalDB] Cleared snapshot {table_name} for {company_name} "
+        f"(local_rows={deleted_local})"
+    )
+    return deleted_local
 
 
 def get_pending_from_local(table_name: str, company_name: str = None, limit: int = 500) -> tuple:
@@ -537,12 +616,26 @@ def stage_deletions(table_name: str, guids: list, company_name: str = "") -> int
     return purged_count
 
 
-def reconcile_local_deletions(table_name: str, tally_active_guids: set, company_name: str) -> int:
+def _sql_ident(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
+
+
+def reconcile_local_deletions(
+    table_name: str,
+    tally_active_guids: set,
+    company_name: str,
+    date_from_iso: str = None,
+    date_to_iso: str = None,
+) -> int:
     """
-    Compares tally_active_guids against records currently in local SQLite table for company_name.
+    Compares tally_active_guids against local SQLite rows for company_name.
     Any local guid NOT in tally_active_guids was deleted in Tally.
-    Stages it for deletion in Supabase and purges it from local SQLite.
-    Zero Supabase calls! 100% offline!
+
+    When date_from_iso and date_to_iso are set (YYYY-MM-DD), only rows whose
+    date falls in that inclusive window are eligible for deletion. Older-year
+    vouchers kept from a previous sync are left alone.
     """
     table_name = TABLE_MAP.get(table_name, table_name)
     conn = get_connection()
@@ -550,22 +643,44 @@ def reconcile_local_deletions(table_name: str, tally_active_guids: set, company_
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         if not cur.fetchone():
             return 0
-        
+
         company_name = _require_company_name(company_name, f"reconcile:{table_name}")
-        rows = conn.execute(
-            f'SELECT guid FROM "{table_name}" WHERE {_exact_company_clause()}',
-            (company_name,),
-        ).fetchall()
-            
         if not tally_active_guids:
             return 0
 
+        date_from = (date_from_iso or "").strip()[:10]
+        date_to = (date_to_iso or "").strip()[:10]
+        date_col = RECONCILE_DATE_COLUMNS.get(table_name)
+        cols = {row["name"] for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()}
+
+        params = [company_name]
+        sql = f'SELECT guid FROM "{table_name}" WHERE {_exact_company_clause()}'
+        if date_from and date_to:
+            if not date_col or date_col not in cols:
+                logging.warning(
+                    f"[LocalDB] Reconcile for {table_name} has a date window but no "
+                    f"{date_col or 'date'} column - skipping deletion to protect older years"
+                )
+                return 0
+            ident = _sql_ident(date_col)
+            sql += (
+                f' AND substr(COALESCE("{ident}", \'\'), 1, 10) >= ?'
+                f' AND substr(COALESCE("{ident}", \'\'), 1, 10) <= ?'
+            )
+            params.extend([date_from, date_to])
+            logging.info(
+                f"[LocalDB] Reconcile {table_name} limited to {date_from}..{date_to}"
+            )
+
+        rows = conn.execute(sql, params).fetchall()
+
         local_guids = {r["guid"] for r in rows if r["guid"]}
         if table_name == "tally_daybook":
-            deleted_guids = [g for g in local_guids if g.split("#sub#")[0] not in tally_active_guids]
+            parent_guids = {g.split("#sub#")[0] for g in local_guids}
+            deleted_guids = [g for g in parent_guids if g not in tally_active_guids]
         else:
             deleted_guids = list(local_guids - tally_active_guids)
-        
+
         if deleted_guids:
             stage_deletions(table_name, deleted_guids, company_name)
             logging.info(f"[LocalDB] Reconciled {len(deleted_guids)} deleted items from {table_name}")
@@ -1168,8 +1283,10 @@ def push_local_table_to_supabase(
                     rec["company_name"] = company_name
                 if not (rec.get("company_name") or "").strip() and supabase_table != "tally_companies":
                     continue
-                if supabase_table == "tally_companies" and not (rec.get("company_name") or "").strip():
-                    continue
+                if supabase_table == "tally_companies":
+                    rec = _prepare_company_master_record(rec)
+                    if not rec.get("company_name") or not rec.get("guid"):
+                        continue
 
                 if supabase_table == "tally_ratio_analysis":
                     # Local PK uses guid (= company_guid); cloud unique is company_guid.
@@ -1240,9 +1357,10 @@ def push_local_table_to_supabase(
             break
 
         if supabase_table == "tally_companies":
+            # Overwrite only when guid, company_name, and company_number all match.
             conflict_target = COMPANY_MASTER_CONFLICT
         elif supabase_table == "tally_ratio_analysis":
-            conflict_target = "company_guid"
+            conflict_target = REPORT_SNAPSHOT_CONFLICT
         elif supabase_table == "tally_cash_flow":
             # One snapshot per company; upsert by name so GUID truncations cannot fork rows.
             conflict_target = "company_name"
@@ -1455,7 +1573,7 @@ def push_financial_report_snapshot(
     try:
         upserted = (
             supabase.table(reports_table)
-            .upsert(report_payload, on_conflict="company_guid")
+            .upsert(report_payload, on_conflict=REPORT_SNAPSHOT_CONFLICT)
             .execute()
         )
         report_row = (upserted.data or [None])[0]
@@ -1463,6 +1581,7 @@ def push_financial_report_snapshot(
             fetched = (
                 supabase.table(reports_table)
                 .select("id")
+                .eq("company_name", company_name)
                 .eq("company_guid", company_guid)
                 .limit(1)
                 .execute()

@@ -24,11 +24,14 @@ from .tally_timeouts import tally_http_timeout
 logger = logging.getLogger(__name__)
 
 
-def indian_fy_start(on: Optional[date] = None) -> date:
-    on = on or date.today()
-    if on.month >= 4:
-        return date(on.year, 4, 1)
-    return date(on.year - 1, 4, 1)
+def indian_fy_start(on: Optional[date] = None, books_from_iso: Optional[str] = None) -> date:
+    from .date_utils import company_period_start
+    return company_period_start(on, books_from_iso)
+
+
+def indian_fy_bounds(on: Optional[date] = None, books_from_iso: Optional[str] = None):
+    from .date_utils import company_period_bounds
+    return company_period_bounds(on, books_from_iso)
 
 
 def _fmt_tally_date(d: date) -> str:
@@ -51,13 +54,22 @@ def fetch_ratio_analysis(
     company_name: str,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    books_from_iso: str = "",
 ) -> dict[str, Any]:
     """
     Export Ratio Analysis from Tally.
-    Default period: Indian FY start → today.
+    Default period: books_from → min(today, that FY end).
     """
-    to_date = to_date or date.today()
-    from_date = from_date or indian_fy_start(to_date)
+    if from_date is None or to_date is None:
+        start, end = indian_fy_bounds(to_date or date.today(), books_from_iso)
+        from_date = from_date or start
+        to_date = to_date or end
+    else:
+        _, fy_end = indian_fy_bounds(to_date, books_from_iso)
+        if to_date > fy_end:
+            to_date = fy_end
+        if to_date < from_date:
+            to_date = from_date
     config = load_config()
     esc = escape(company_name)
     xml = f"""<ENVELOPE>
@@ -172,9 +184,10 @@ def push_ratio_analysis_to_supabase(company_name: str) -> tuple:
 def sync_ratio_analysis(
     company_name: str,
     company_guid: str = "",
+    books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Fetch FY→today Ratio Analysis → local DB → Supabase."""
-    payload = fetch_ratio_analysis(company_name)
+    """Fetch books_from→today Ratio Analysis → local DB → Supabase."""
+    payload = fetch_ratio_analysis(company_name, books_from_iso=books_from_iso)
     staged = stage_ratio_analysis_local(company_name, company_guid, payload)
     if staged < 1:
         raise RuntimeError("Failed to stage tally_ratio_analysis to local DB")

@@ -1,5 +1,5 @@
 """
-Fetch Tally Cash Flow (monthly Inflow / Outflow / Nett) for Indian FY start → today.
+Fetch Tally Cash Flow (monthly Inflow / Outflow / Nett) for books_from → FY end (or today).
 Stage into local SQLite first, then push to Supabase (same pattern as Ratio Analysis).
 """
 
@@ -18,7 +18,7 @@ from supabase import create_client
 from .cash_flow_summary import attach_summaries_to_months
 from .config import load_config
 from .local_db import push_local_table_to_supabase, save_to_local_db
-from .ratio_analysis import indian_fy_start
+from .date_utils import company_period_bounds
 from .source_values import decode_response
 from .tally_timeouts import tally_http_timeout
 
@@ -82,10 +82,20 @@ def fetch_cash_flow(
     company_name: str,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Export monthly Cash Flow from Tally. Default: Indian FY start → today."""
-    to_date = to_date or date.today()
-    from_date = from_date or indian_fy_start(to_date)
+    """Export monthly Cash Flow. Default: books_from → min(today, that FY end)."""
+    if from_date is None or to_date is None:
+        start, end = company_period_bounds(to_date or date.today(), books_from_iso)
+        from_date = from_date or start
+        to_date = to_date or end
+    else:
+        # Still clamp a caller-supplied window to the company's FY.
+        _, fy_end = company_period_bounds(to_date, books_from_iso)
+        if to_date > fy_end:
+            to_date = fy_end
+        if to_date < from_date:
+            to_date = from_date
     config = load_config()
     esc = escape(company_name)
     xml = f"""<ENVELOPE>
@@ -165,9 +175,10 @@ def push_cash_flow_to_supabase(company_name: str) -> tuple:
 def sync_cash_flow(
     company_name: str,
     company_guid: str = "",
+    books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Fetch FY→today Cash Flow → local DB → Supabase."""
-    payload = fetch_cash_flow(company_name)
+    """Fetch books_from→FY-end (or today) Cash Flow → local DB → Supabase."""
+    payload = fetch_cash_flow(company_name, books_from_iso=books_from_iso)
     staged = stage_cash_flow_local(company_name, company_guid, payload)
     if staged < 1:
         raise RuntimeError("Failed to stage tally_cash_flow to local DB")

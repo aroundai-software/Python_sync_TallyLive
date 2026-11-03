@@ -97,6 +97,30 @@ class ConnectorRegressionTests(unittest.TestCase):
         scope=functions('outstanding_payables.py',{'get_text','clean_text','format_tally_date','julian_to_date','resolve_due_date_and_credit_days'})
         due,days,_=scope['resolve_due_date_and_credit_days']({'BILLCREDITPERIOD':'12-Apr-20'},'2020-03-12')
         self.assertEqual((due,days),('2020-04-12',31))
+    def test_company_identity_requires_all_three_fields(self):
+        scope=functions('tally_companies.py',{'normalize_company_number','company_identity_key','apply_company_identity'})
+        same={'guid':'3722','company_name':'S & D GlobeMate (2026-2027)','company_number':'123'}
+        self.assertEqual(scope['company_identity_key'](same),('3722','S & D GlobeMate (2026-2027)','123'))
+        self.assertEqual(
+            scope['company_identity_key']({'guid':' 3722 ','company_name':'S & D GlobeMate (2026-2027)','company_number':' 123 '}),
+            scope['company_identity_key'](same),
+        )
+        self.assertEqual(scope['normalize_company_number'](None),'')
+        self.assertEqual(scope['normalize_company_number']('  '),'')
+        self.assertEqual(
+            scope['company_identity_key']({'guid':'3722','company_name':'A','company_number':None}),
+            scope['company_identity_key']({'guid':'3722','company_name':'A','company_number':''}),
+        )
+        year_file={'guid':'3722','company_name':'S & D GlobeMate (2023-24)','company_number':'123'}
+        self.assertNotEqual(scope['company_identity_key'](same),scope['company_identity_key'](year_file))
+        other_guid={'guid':'aaaa','company_name':'S & D GlobeMate (2026-2027)','company_number':'123'}
+        other_number={'guid':'3722','company_name':'S & D GlobeMate (2026-2027)','company_number':'999'}
+        self.assertNotEqual(scope['company_identity_key'](same),scope['company_identity_key'](other_guid))
+        self.assertNotEqual(scope['company_identity_key'](same),scope['company_identity_key'](other_number))
+        prepared=scope['apply_company_identity']({**same,'id':'should-not-rewrite','company_number':None})
+        self.assertNotIn('id',prepared)
+        self.assertEqual(prepared['company_number'],'')
+        self.assertEqual(prepared['guid'],'3722')
     def test_reconcile_ignores_global_high_water_mark(self):
         with patch.dict(os.environ,{'FULL_RECONCILE':'1'}):self.assertEqual(reconcile_from_id(176999),0)
     def test_balance_lookup_paginates_beyond_1000(self):

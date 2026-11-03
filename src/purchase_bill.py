@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import re
 import requests
 import time
@@ -188,7 +188,7 @@ def get_last_start_alter_id(company_name: str) -> int:
 # TALLY FETCH
 # =====================================================
 
-def get_purchase_bills(company_name: str = None):
+def get_purchase_bills(company_name: str = None, books_from_iso: str = None):
 
     config = load_config()
     tally_url = config["tally_url"]
@@ -221,8 +221,12 @@ def get_purchase_bills(company_name: str = None):
     tax_ledgers = get_tax_ledgers(company_name)
     logging.info(f"Loaded {len(tax_ledgers)} tax ledgers")
 
-    from .date_utils import get_current_fy_monthly_date_ranges
-    date_ranges = get_current_fy_monthly_date_ranges()
+    from .date_utils import get_company_voucher_date_ranges
+    date_ranges = get_company_voucher_date_ranges(books_from_iso)
+    logging.info(
+        f"Purchase bills window books_from={books_from_iso or 'current FY'} "
+        f"chunks={len(date_ranges)}"
+    )
 
     # Fetch max alter_id from local SQLite
     max_alter_id = reconcile_from_id(get_max_alter_id_local("purchase_invoices", company_name))
@@ -433,22 +437,20 @@ def save_purchase_bills_to_supabase(purchase_bills=None, company_name=None):
     return staged
 
 
-def reconcile_deleted_purchase_bills(company_name: str) -> int:
+def reconcile_deleted_purchase_bills(company_name: str, books_from_iso: str = None) -> int:
     """
-    Fetches all active Purchase Voucher GUIDs from Tally for the current FY,
-    compares them against Supabase 'purchase_invoices', and deletes any records
-    (and their corresponding 'invoice_items_purchase') that were deleted in Tally.
+    Fetches active Purchase Voucher GUIDs from Tally for the company books window.
+    Deletes local/cloud purchases only inside that date window.
     """
     config = load_config()
     tally_url = config.get("tally_url", "http://localhost:9000")
-    from .date_utils import get_current_fy_monthly_date_ranges
-    date_ranges = get_current_fy_monthly_date_ranges()
+    from .date_utils import get_company_voucher_date_ranges, iso_window_from_tally_ranges
+    date_ranges = get_company_voucher_date_ranges(books_from_iso)
     if not date_ranges:
         return 0
-
     fy_start = date_ranges[0][0]
     fy_end = date_ranges[-1][1]
-    fy_start_iso = f"{fy_start[:4]}-{fy_start[4:6]}-{fy_start[6:8]}"
+    fy_start_iso, fy_end_iso = iso_window_from_tally_ranges(date_ranges)
 
     xml_request = f"""<ENVELOPE>
     <HEADER>
@@ -518,7 +520,17 @@ def reconcile_deleted_purchase_bills(company_name: str) -> int:
         return 0
 
     from .local_db import reconcile_local_deletions
-    return reconcile_local_deletions("purchase_invoices", tally_active_guids, company_name)
+    logging.info(
+        f"Purchase reconcile window {fy_start_iso}..{fy_end_iso} "
+        f"({len(tally_active_guids)} active Tally GUIDs)"
+    )
+    return reconcile_local_deletions(
+        "purchase_invoices",
+        tally_active_guids,
+        company_name,
+        date_from_iso=fy_start_iso,
+        date_to_iso=fy_end_iso,
+    )
 
 
 

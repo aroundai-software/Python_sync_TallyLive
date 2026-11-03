@@ -1,4 +1,4 @@
-﻿import time
+import time
 import logging
 import os
 import socket
@@ -272,7 +272,9 @@ def run_sync_cycle():
 
         for comp_idx, company_data in enumerate(all_companies, 1):
             company_name = company_data.get("company_name", "Unknown")
+            books_from = company_data.get("books_from") or company_data.get("financial_year_from")
             logging.info(f"\n--- [Company {comp_idx}/{len(all_companies)}] Starting Sync for: {company_name} ---")
+            logging.info(f"Company books_from={books_from or '(none; using current FY)'}")
             
             # Initialize logger for this company (16 steps; FR + Ratio + Cash Flow)
             logger = SyncLogger(total_steps=16)
@@ -371,10 +373,10 @@ def run_sync_cycle():
                 print(f" [5/16] ERROR Stock Items sync failed: {e}\n")
             # 6. Sale Bills
             try:
-                sale_bills_data = sale_bill.get_sale_bills(company_name)
+                sale_bills_data = sale_bill.get_sale_bills(company_name, books_from_iso=books_from)
                 saved_count = sale_bill.save_sale_bills_to_supabase(sale_bills_data, company_name)
                 count = saved_count if saved_count > 0 else (len(sale_bills_data) if sale_bills_data else 0)
-                del_count = sale_bill.reconcile_deleted_sale_bills(company_name)
+                del_count = sale_bill.reconcile_deleted_sale_bills(company_name, books_from_iso=books_from)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} sale bills{del_msg} for {company_name}")
                 print(f" [6/16] Synced {count} Sale Bills{del_msg}\n")
@@ -385,7 +387,7 @@ def run_sync_cycle():
                 
             # 7. Sale Bill Items
             try:
-                sale_bill_items_data = sale_bill_item.get_sale_bill_items(company_name)
+                sale_bill_items_data = sale_bill_item.get_sale_bill_items(company_name, books_from_iso=books_from)
                 saved_count = sale_bill_item.save_sale_bill_items_to_supabase(sale_bill_items_data, company_name)
                 count = saved_count if saved_count > 0 else (len(sale_bill_items_data) if sale_bill_items_data else 0)
                 logging.info(f"Synced {count} sale bill items for {company_name}")
@@ -397,10 +399,10 @@ def run_sync_cycle():
 
             # 8. Purchase Bills
             try:
-                purchase_bills_data = purchase_bill.get_purchase_bills(company_name)
+                purchase_bills_data = purchase_bill.get_purchase_bills(company_name, books_from_iso=books_from)
                 saved_count = purchase_bill.save_purchase_bills_to_supabase(purchase_bills_data, company_name)
                 count = saved_count if saved_count > 0 else (len(purchase_bills_data) if purchase_bills_data else 0)
-                del_count = purchase_bill.reconcile_deleted_purchase_bills(company_name)
+                del_count = purchase_bill.reconcile_deleted_purchase_bills(company_name, books_from_iso=books_from)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} purchase bills{del_msg} for {company_name}")
                 print(f" [8/16] Synced {count} Purchase Bills{del_msg}\n")
@@ -413,7 +415,7 @@ def run_sync_cycle():
 
             # 9. Purchase Bill Items
             try:
-                purchase_bill_items_data = purchase_bill_item.get_purchase_bill_items(company_name)
+                purchase_bill_items_data = purchase_bill_item.get_purchase_bill_items(company_name, books_from_iso=books_from)
                 saved_count = purchase_bill_item.save_purchase_bill_items_to_supabase(purchase_bill_items_data, company_name)
                 count = saved_count if saved_count > 0 else (len(purchase_bill_items_data) if purchase_bill_items_data else 0)
                 logging.info(f"Synced {count} purchase bill items for {company_name}")
@@ -426,13 +428,15 @@ def run_sync_cycle():
             # 10. Outstanding Receivables (+ sales invoice Pending/Paid from bill numbers)
             try:
                 outstanding_receivables_data = (
-                    outstanding_receivables.get_outstanding_receivables(company_name) or []
+                    outstanding_receivables.get_outstanding_receivables(
+                        company_name, books_from_iso=books_from
+                    )
+                    or []
                 )
                 count = len(outstanding_receivables_data)
-                if outstanding_receivables_data:
-                    outstanding_receivables.save_outstanding_receivables_to_supabase(
-                        outstanding_receivables_data, company_name
-                    )
+                outstanding_receivables.save_outstanding_receivables_to_supabase(
+                    outstanding_receivables_data, company_name
+                )
                 sales_status = invoice_status.apply_invoice_status_from_outstanding(
                     company_name,
                     "sales_invoices",
@@ -456,13 +460,15 @@ def run_sync_cycle():
             # 11. Outstanding Payables (+ purchase invoice Pending/Paid from bill numbers)
             try:
                 outstanding_payables_data = (
-                    outstanding_payables.get_outstanding_payables(company_name) or []
+                    outstanding_payables.get_outstanding_payables(
+                        company_name, books_from_iso=books_from
+                    )
+                    or []
                 )
                 count = len(outstanding_payables_data)
-                if outstanding_payables_data:
-                    outstanding_payables.save_outstanding_payables_to_supabase(
-                        outstanding_payables_data, company_name
-                    )
+                outstanding_payables.save_outstanding_payables_to_supabase(
+                    outstanding_payables_data, company_name
+                )
                 purchase_status = invoice_status.apply_invoice_status_from_outstanding(
                     company_name,
                     "purchase_invoices",
@@ -485,10 +491,10 @@ def run_sync_cycle():
 
             # 12. Daybook
             try:
-                daybook_data = daybook.get_daybook(company_name)
+                daybook_data = daybook.get_daybook(company_name, books_from_iso=books_from)
                 saved_count = daybook.save_daybook_to_supabase(daybook_data, company_name)
                 count = saved_count if saved_count > 0 else (len(daybook_data) if daybook_data else 0)
-                del_count = daybook.reconcile_deleted_daybook(company_name)
+                del_count = daybook.reconcile_deleted_daybook(company_name, books_from_iso=books_from)
                 del_msg = f" (Removed {del_count} deleted)" if del_count else ""
                 logging.info(f"Synced {count} daybook entries{del_msg} for {company_name}")
                 print(f" [12/16] Synced {count} Daybook Entries{del_msg}\n")
@@ -500,7 +506,7 @@ def run_sync_cycle():
             # 13. Settled Bills
             try:
                 print(f" [13/16] Syncing Settled Bills for {company_name}...\n")
-                count = settled_bills.sync_settled_bills(company_name)
+                count = settled_bills.sync_settled_bills(company_name, books_from_iso=books_from)
                 count = count if count is not None else 0
                 logging.info(f"Synced {count} settled bills for {company_name}")
                 print(f" [13/16] Synced {count} Settled Bills\n")

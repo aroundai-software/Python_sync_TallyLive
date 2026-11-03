@@ -190,13 +190,13 @@ def format_bills(bills: list, company_name: str, alter_id: int, now_ts: str) -> 
 # STEP 1: FIND AFFECTED LEDGERS VIA ALTERID
 # =====================================================
 
-def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int) -> dict:
+def fetch_affected_ledgers(tally_url: str, company_name: str, max_alter_id: int, books_from_iso: str = None) -> dict:
     """
     Fetch Receipt + Payment vouchers where alter_id > max_alter_id.
     Chunks by month during initial load to prevent Tally memory blowup and freezes.
     """
-    from .date_utils import get_current_fy_monthly_date_ranges
-    date_ranges = get_current_fy_monthly_date_ranges()
+    from .date_utils import get_company_voucher_date_ranges
+    date_ranges = get_company_voucher_date_ranges(books_from_iso)
     if not date_ranges:
         date_ranges = [("20250401", "20260331")]
 
@@ -413,7 +413,7 @@ def incremental_load_affected(tally_url: str, company_name: str,
 # MAIN SYNC FUNCTION
 # =====================================================
 
-def sync_settled_bills(company_name: str = None):
+def sync_settled_bills(company_name: str = None, books_from_iso: str = None):
     try:
         config = load_config()
         tally_url = config["tally_url"]
@@ -428,7 +428,10 @@ def sync_settled_bills(company_name: str = None):
         # ── Get last processed alter_id ────────────────────────────────────
         max_alter_id = get_max_alter_id(supabase, company_name)
         logging.info(f"Querying Settled Bills for company: {company_name}...")
-        logging.info(f"Settled bills incremental sync from alter_id > {max_alter_id}")
+        logging.info(
+            f"Settled bills incremental sync from alter_id > {max_alter_id} "
+            f"(books_from={books_from_iso or 'current FY'})"
+        )
 
         formatted_records = []
 
@@ -440,7 +443,9 @@ def sync_settled_bills(company_name: str = None):
                 return 0
 
             # Get current max receipt alter_id from Tally for checkpoint
-            affected_for_checkpoint = fetch_affected_ledgers(tally_url, company_name, 0)
+            affected_for_checkpoint = fetch_affected_ledgers(
+                tally_url, company_name, 0, books_from_iso=books_from_iso
+            )
             current_alter_id = max(affected_for_checkpoint.values()) if affected_for_checkpoint else 1
 
             formatted_records = full_load_all_customers(
@@ -448,7 +453,9 @@ def sync_settled_bills(company_name: str = None):
             )
         else:
             # ── INCREMENTAL: Only process ledgers with new payment activity ─
-            affected_ledgers = fetch_affected_ledgers(tally_url, company_name, max_alter_id)
+            affected_ledgers = fetch_affected_ledgers(
+                tally_url, company_name, max_alter_id, books_from_iso=books_from_iso
+            )
 
             if not affected_ledgers:
                 logging.info("No new payment activity. Settled bills already up to date.")
