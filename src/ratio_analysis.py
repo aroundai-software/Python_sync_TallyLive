@@ -29,9 +29,13 @@ def indian_fy_start(on: Optional[date] = None, books_from_iso: Optional[str] = N
     return company_period_start(on, books_from_iso)
 
 
-def indian_fy_bounds(on: Optional[date] = None, books_from_iso: Optional[str] = None):
+def indian_fy_bounds(
+    on: Optional[date] = None,
+    books_from_iso: Optional[str] = None,
+    company_name: Optional[str] = None,
+):
     from .date_utils import company_period_bounds
-    return company_period_bounds(on, books_from_iso)
+    return company_period_bounds(on, books_from_iso, company_name)
 
 
 def _fmt_tally_date(d: date) -> str:
@@ -61,11 +65,13 @@ def fetch_ratio_analysis(
     Default period: books_from → min(today, that FY end).
     """
     if from_date is None or to_date is None:
-        start, end = indian_fy_bounds(to_date or date.today(), books_from_iso)
+        start, end = indian_fy_bounds(
+            to_date or date.today(), books_from_iso, company_name
+        )
         from_date = from_date or start
         to_date = to_date or end
     else:
-        _, fy_end = indian_fy_bounds(to_date, books_from_iso)
+        _, fy_end = indian_fy_bounds(to_date, books_from_iso, company_name)
         if to_date > fy_end:
             to_date = fy_end
         if to_date < from_date:
@@ -155,15 +161,19 @@ def stage_ratio_analysis_local(
     company_guid: str,
     payload: dict[str, Any],
 ) -> int:
-    """Write Ratio Analysis snapshot into local SQLite as pending."""
-    guid = (company_guid or "").strip() or company_name
+    """Write Ratio Analysis snapshot into local SQLite as pending (one row per FY)."""
+    company_guid = (company_guid or "").strip() or company_name
+    from_date = payload["from_date"]
+    from_iso = from_date.isoformat() if hasattr(from_date, "isoformat") else str(from_date)[:10]
+    to_date = payload["to_date"]
+    to_iso = to_date.isoformat() if hasattr(to_date, "isoformat") else str(to_date)[:10]
     now = datetime.now(timezone.utc).isoformat()
     record = {
-        "guid": guid,
+        "guid": f"{company_guid}#{from_iso}",
         "company_name": company_name,
-        "company_guid": guid,
-        "from_date": payload["from_date"].isoformat(),
-        "to_date": payload["to_date"].isoformat(),
+        "company_guid": company_guid,
+        "from_date": from_iso,
+        "to_date": to_iso,
         "recv_turnover_days": payload.get("recv_turnover_days"),
         "ratios": json.dumps(payload.get("ratios") or {}, ensure_ascii=False),
         "synced_at": now,
@@ -186,29 +196,67 @@ def sync_ratio_analysis(
     company_guid: str = "",
     books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Fetch books_from→today Ratio Analysis → local DB → Supabase."""
-    payload = fetch_ratio_analysis(company_name, books_from_iso=books_from_iso)
-    staged = stage_ratio_analysis_local(company_name, company_guid, payload)
-    if staged < 1:
-        raise RuntimeError("Failed to stage tally_ratio_analysis to local DB")
+    """Fetch Ratio Analysis per FY (capped per run) → local DB → Supabase."""
+    from .date_utils import iter_company_fy_windows
+    from .financial_reports import _select_fy_windows_for_sync
+
+    all_windows = list(
+        iter_company_fy_windows(date.today(), books_from_iso, company_name)
+    )
+    windows = _select_fy_windows_for_sync(all_windows, company_name, force=False)
+    staged_total = 0
+    last_payload = None
+    errors: list[str] = []
+    for i, (fy_from, fy_to) in enumerate(windows):
+        if i > 0:
+            time.sleep(1.0)
+        try:
+            payload = fetch_ratio_analysis(
+                company_name,
+                from_date=fy_from,
+                to_date=fy_to,
+                books_from_iso=books_from_iso,
+            )
+            staged_total += stage_ratio_analysis_local(
+                company_name, company_guid, payload
+            )
+            last_payload = payload
+        except Exception as e:
+            errors.append(f"{fy_from}→{fy_to}: {e}")
+            logger.error(
+                f"Ratio Analysis failed for {company_name} [{fy_from}→{fy_to}]: {e}"
+            )
+
+    if staged_total < 1:
+        raise RuntimeError(
+            "Failed to stage tally_ratio_analysis to local DB"
+            + (f" ({'; '.join(errors)})" if errors else "")
+        )
 
     pushed, push_err = push_ratio_analysis_to_supabase(company_name)
+    payload = last_payload or {}
     days = payload.get("recv_turnover_days")
     logger.info(
-        f"Ratio Analysis synced for {company_name}: "
+        f"Ratio Analysis synced for {company_name}: years={len(windows)} "
         f"Recv. Turnover={days} days "
-        f"({payload['from_date']} → {payload['to_date']}); "
-        f"local=1 cloud={pushed}"
+        f"last=({payload.get('from_date')} → {payload.get('to_date')}); "
+        f"cloud={pushed}"
         + (f" push_err={push_err}" if push_err else "")
     )
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
     result = {
-        "status": "ok" if not push_err else "partial",
+        "status": "ok" if not push_err and not errors else "partial",
+        "years": len(windows),
         "recv_turnover_days": days,
-        "from_date": payload["from_date"].isoformat(),
-        "to_date": payload["to_date"].isoformat(),
+        "from_date": _iso(payload.get("from_date")),
+        "to_date": _iso(payload.get("to_date")),
         "staged_local": True,
         "pushed": pushed or 0,
     }
     if push_err:
         result["push_error"] = push_err
+    if errors:
+        result["errors"] = errors
     return result

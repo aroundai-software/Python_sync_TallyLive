@@ -413,18 +413,23 @@ def fetch_balance_sheet(
     company_guid: str,
     as_on: Optional[date] = None,
     books_from_iso: Optional[str] = None,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
 ) -> ReportSnapshot:
     from .date_utils import company_period_bounds
 
-    from_date, as_on = company_period_bounds(as_on or date.today(), books_from_iso)
-    xml_text = export_tally_report("Balance Sheet", company_name, from_date, as_on)
+    if from_date is None or to_date is None:
+        from_date, to_date = company_period_bounds(
+            as_on or date.today(), books_from_iso, company_name
+        )
+    xml_text = export_tally_report("Balance Sheet", company_name, from_date, to_date)
     lines = parse_balance_sheet_xml(xml_text)
     return ReportSnapshot(
         report_type="balance_sheet",
         company_name=company_name,
         company_guid=company_guid or "",
         from_date=from_date.isoformat(),
-        to_date=as_on.isoformat(),
+        to_date=to_date.isoformat(),
         lines=lines,
     )
 
@@ -434,18 +439,23 @@ def fetch_profit_and_loss(
     company_guid: str,
     as_on: Optional[date] = None,
     books_from_iso: Optional[str] = None,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
 ) -> ReportSnapshot:
     from .date_utils import company_period_bounds
 
-    from_date, as_on = company_period_bounds(as_on or date.today(), books_from_iso)
-    xml_text = export_tally_report("Profit and Loss", company_name, from_date, as_on)
+    if from_date is None or to_date is None:
+        from_date, to_date = company_period_bounds(
+            as_on or date.today(), books_from_iso, company_name
+        )
+    xml_text = export_tally_report("Profit and Loss", company_name, from_date, to_date)
     lines = parse_profit_loss_xml(xml_text)
     return ReportSnapshot(
         report_type="profit_and_loss",
         company_name=company_name,
         company_guid=company_guid or "",
         from_date=from_date.isoformat(),
-        to_date=as_on.isoformat(),
+        to_date=to_date.isoformat(),
         lines=lines,
     )
 
@@ -605,8 +615,9 @@ def _build_line_row(
                 section = "expenses"
 
     line_key = _slug_key(particulars)
-    # Local PK; stripped on Phase 3 upload (cloud lines use report_id).
-    line_guid = f"{snapshot.company_guid}#{line_prefix}#{idx:05d}#{line_key}"
+    # Local PK scoped by FY from_date so multi-year snapshots do not collide.
+    fy = (snapshot.from_date or "")[:10]
+    line_guid = f"{snapshot.company_guid}#{fy}#{line_prefix}#{idx:05d}#{line_key}"
     return {
         "guid": line_guid,
         "company_name": snapshot.company_name,
@@ -655,8 +666,9 @@ def save_balance_sheet_snapshot(snapshot: ReportSnapshot) -> dict:
         else:
             liab += abs(gap)
 
+    fy = (snapshot.from_date or "")[:10]
     report_payload = {
-        "guid": snapshot.company_guid,
+        "guid": f"{snapshot.company_guid}#{fy}",
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
         "from_date": snapshot.from_date,
@@ -750,8 +762,9 @@ def save_profit_loss_snapshot(snapshot: ReportSnapshot) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
 
     gross, nett = _compute_pl_gross_nett(snapshot.lines)
+    fy = (snapshot.from_date or "")[:10]
     report_payload = {
-        "guid": snapshot.company_guid,
+        "guid": f"{snapshot.company_guid}#{fy}",
         "company_name": snapshot.company_name,
         "company_guid": snapshot.company_guid,
         "from_date": snapshot.from_date,
@@ -1275,6 +1288,68 @@ def financial_reports_due(company_guid: str) -> tuple[bool, str]:
     return True, f"afternoon_slot({target.strftime('%H:%M')})"
 
 
+def _fy_per_sync_limit(*, force: bool = False) -> int:
+    """Max FY windows per sync cycle — keeps Tally from freezing on long history."""
+    key = "FINANCIAL_REPORTS_FY_PER_SYNC_FORCE" if force else "FINANCIAL_REPORTS_FY_PER_SYNC"
+    default = "3" if force else "2"
+    try:
+        return max(1, int(os.environ.get(key, default).strip() or default))
+    except Exception:
+        return 3 if force else 2
+
+
+def _local_report_from_dates(reports_table: str, company_name: str) -> set[str]:
+    """FY from_date values already staged locally for this company."""
+    try:
+        from .local_db import get_connection, _exact_company_clause, _require_company_name
+
+        company_name = _require_company_name(company_name, f"fy:{reports_table}")
+        conn = get_connection()
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (reports_table,),
+            )
+            if not cur.fetchone():
+                return set()
+            rows = conn.execute(
+                f'SELECT DISTINCT from_date FROM "{reports_table}" '
+                f"WHERE {_exact_company_clause()}",
+                (company_name,),
+            ).fetchall()
+            out = set()
+            for r in rows:
+                v = r[0] if not hasattr(r, "keys") else r["from_date"]
+                if v:
+                    out.add(str(v)[:10])
+            return out
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
+
+def _select_fy_windows_for_sync(windows, company_name: str, *, force: bool = False):
+    """
+    Always refresh the newest (current) FY; backfill older missing FYs up to the
+    per-sync cap so history fills across cycles without hammering Tally.
+    """
+    if not windows:
+        return []
+    limit = _fy_per_sync_limit(force=force)
+    current = windows[-1]
+    selected = [current]
+    existing = _local_report_from_dates("balance_sheet_reports", company_name)
+    for w in windows[:-1]:
+        if len(selected) >= limit:
+            break
+        if force or w[0].isoformat() not in existing:
+            selected.append(w)
+    # Oldest-first after current for steadier Tally load / predictable backfill.
+    rest = sorted(selected[1:], key=lambda x: x[0])
+    return [current] + rest
+
+
 def sync_financial_reports(
     company_name: str,
     company_guid: Optional[str] = None,
@@ -1366,66 +1441,92 @@ def sync_financial_reports(
         logging.info(f"Financial reports due for {company_name}: {due_reason}")
 
     _, _, remote = report_export_settings()
+    from .date_utils import iter_company_fy_windows
+
+    all_windows = list(
+        iter_company_fy_windows(as_on, books_from, company_name)
+    )
+    windows = _select_fy_windows_for_sync(
+        all_windows, company_name, force=force or full_reconcile
+    )
     logging.info(
         f"Exporting Balance Sheet & Profit and Loss for {company_name} "
-        f"({'remote/cloud Tally' if remote else 'local Tally'})..."
+        f"({'remote/cloud Tally' if remote else 'local Tally'}); "
+        f"FY windows this run={len(windows)}/{len(all_windows)} "
+        f"{[(a.isoformat(), b.isoformat()) for a, b in windows]}"
     )
+
     errors: list[str] = []
     bs = None
     pl = None
-    try:
-        bs = fetch_balance_sheet(
-            company_name, guid, as_on=as_on, books_from_iso=books_from
-        )
-    except Exception as e:
-        errors.append(f"Balance Sheet: {e}")
-        logging.error(f"Balance Sheet export failed for {company_name}: {e}")
-
-    # If BS already timed out on remote Tally, skip P&L this attempt.
-    # Local Tally still tries both — LAN can usually finish.
-    if bs is None and remote:
-        errors.append(
-            "Profit and Loss: skipped after Balance Sheet failure (remote Tally)"
-        )
-        logging.warning(
-            f"Skipping Profit and Loss for {company_name} after remote BS failure "
-            f"to avoid further Tally load this attempt."
-        )
-    else:
-        time.sleep(5.0 if remote else 0.5)
-        try:
-            pl = fetch_profit_and_loss(
-                company_name, guid, as_on=as_on, books_from_iso=books_from
-            )
-        except Exception as e:
-            errors.append(f"Profit and Loss: {e}")
-            logging.error(f"Profit and Loss export failed for {company_name}: {e}")
-
     bs_saved = {"lines": 0}
     pl_saved = {"lines": 0}
-    if bs is not None:
-        if not bs.lines:
-            errors.append("Balance Sheet: Tally returned no parseable lines")
-            logging.error(f"Balance Sheet empty for {company_name}")
-            bs = None
-        else:
-            bs_saved = save_balance_sheet_snapshot(bs)
-    if pl is not None:
-        if not pl.lines:
-            errors.append("Profit and Loss: Tally returned no parseable lines")
-            logging.error(f"Profit and Loss empty for {company_name}")
-            pl = None
-        else:
-            pl_saved = save_profit_loss_snapshot(pl)
+    bs_line_total = 0
+    pl_line_total = 0
+    years_ok = 0
+
+    for wi, (fy_from, fy_to) in enumerate(windows):
+        if wi > 0:
+            time.sleep(5.0 if remote else 1.0)
+        label = f"{fy_from.isoformat()}→{fy_to.isoformat()}"
+        logging.info(f"Financial reports FY {label} for {company_name}...")
+        year_bs = None
+        year_pl = None
+        try:
+            year_bs = fetch_balance_sheet(
+                company_name,
+                guid,
+                from_date=fy_from,
+                to_date=fy_to,
+            )
+        except Exception as e:
+            errors.append(f"Balance Sheet [{label}]: {e}")
+            logging.error(f"Balance Sheet export failed for {company_name} [{label}]: {e}")
+            if remote:
+                errors.append(
+                    f"Profit and Loss [{label}]: skipped after Balance Sheet failure"
+                )
+                continue
+
+        if year_bs is not None:
+            time.sleep(5.0 if remote else 0.5)
+        try:
+            year_pl = fetch_profit_and_loss(
+                company_name,
+                guid,
+                from_date=fy_from,
+                to_date=fy_to,
+            )
+        except Exception as e:
+            errors.append(f"Profit and Loss [{label}]: {e}")
+            logging.error(f"Profit and Loss export failed for {company_name} [{label}]: {e}")
+
+        if year_bs is not None and not year_bs.lines:
+            errors.append(f"Balance Sheet [{label}]: Tally returned no parseable lines")
+            year_bs = None
+        if year_pl is not None and not year_pl.lines:
+            errors.append(f"Profit and Loss [{label}]: Tally returned no parseable lines")
+            year_pl = None
+
+        if year_bs is not None:
+            bs_saved = save_balance_sheet_snapshot(year_bs)
+            bs_line_total += int(bs_saved.get("lines") or 0)
+            bs = year_bs
+        if year_pl is not None:
+            pl_saved = save_profit_loss_snapshot(year_pl)
+            pl_line_total += int(pl_saved.get("lines") or 0)
+            pl = year_pl
+        if year_bs is not None or year_pl is not None:
+            years_ok += 1
 
     logging.info(
         f"Staged financial reports locally for {company_name}: "
-        f"BS lines={bs_saved.get('lines', 0)}, P&L lines={pl_saved.get('lines', 0)}"
+        f"years_ok={years_ok}/{len(windows)}, "
+        f"BS lines={bs_line_total}, P&L lines={pl_line_total}"
     )
 
-    if errors and (bs is None or pl is None):
-        # Both empty (no usable lines) → reports not available in Tally; skip ~7 days.
-        if bs is None and pl is None and _errors_look_like_empty_reports(errors):
+    if years_ok == 0 and errors:
+        if _errors_look_like_empty_reports(errors):
             until = mark_financial_reports_unavailable(guid, reason="empty_reports")
             msg = (
                 f"Tally BS/P&L not available (empty reports); "
@@ -1448,29 +1549,18 @@ def sync_financial_reports(
 
         attempt_entry = mark_financial_reports_attempt_failed(guid, due_reason)
         retry_after = attempt_entry.get("next_retry_after")
-        msg = "; ".join(errors)
-        if bs is not None and pl is None:
-            msg = (
-                f"Partial financial reports: {msg} "
-                f"(saved BS=True, P&L=False)"
-            )
-        elif bs is None and pl is not None:
-            msg = (
-                f"Partial financial reports: {msg} "
-                f"(saved BS=False, P&L=True)"
-            )
         return {
             "status": "failed",
             "skipped": False,
             "deferred": bool(retry_after),
-            "reason": msg,
+            "reason": "; ".join(errors),
             "company_name": company_name,
             "company_guid": guid,
             "as_on": as_on.isoformat(),
             "balance_sheet": bs_saved,
             "profit_and_loss": pl_saved,
-            "bs_line_count": len(bs.lines) if bs else 0,
-            "pl_line_count": len(pl.lines) if pl else 0,
+            "bs_line_count": bs_line_total,
+            "pl_line_count": pl_line_total,
             "next_retry_after": retry_after,
             "errors": errors,
         }
@@ -1496,10 +1586,12 @@ def sync_financial_reports(
         "as_on": as_on.isoformat(),
         "balance_sheet": bs_saved,
         "profit_and_loss": pl_saved,
-        "bs_line_count": len(bs.lines) if bs else 0,
-        "pl_line_count": len(pl.lines) if pl else 0,
+        "bs_line_count": bs_line_total,
+        "pl_line_count": pl_line_total,
+        "years_synced": years_ok,
         "push": push_results,
         "push_errors": push_errors,
+        "errors": errors,
     }
 
 
@@ -1565,7 +1657,9 @@ def run_spike(
     from .date_utils import company_period_bounds
 
     books_from = company.get("books_from") or company.get("financial_year_from")
-    from_date, as_on = company_period_bounds(as_on or date.today(), books_from)
+    from_date, as_on = company_period_bounds(
+        as_on or date.today(), books_from, name
+    )
 
     root = Path(__file__).resolve().parents[1]
     out_dir = out_dir or (root / "data" / "financial_report_spike")

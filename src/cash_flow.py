@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 from xml.sax.saxutils import escape
@@ -84,14 +85,16 @@ def fetch_cash_flow(
     to_date: Optional[date] = None,
     books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Export monthly Cash Flow. Default: books_from → min(today, that FY end)."""
+    """Export monthly Cash Flow. Default: one FY window (see company_period_bounds)."""
     if from_date is None or to_date is None:
-        start, end = company_period_bounds(to_date or date.today(), books_from_iso)
+        start, end = company_period_bounds(
+            to_date or date.today(), books_from_iso, company_name
+        )
         from_date = from_date or start
         to_date = to_date or end
     else:
-        # Still clamp a caller-supplied window to the company's FY.
-        _, fy_end = company_period_bounds(to_date, books_from_iso)
+        # Still clamp a caller-supplied window to one safe FY.
+        _, fy_end = company_period_bounds(to_date, books_from_iso, company_name)
         if to_date > fy_end:
             to_date = fy_end
         if to_date < from_date:
@@ -144,15 +147,19 @@ def stage_cash_flow_local(
     company_guid: str,
     payload: dict[str, Any],
 ) -> int:
-    """Write Cash Flow snapshot into local SQLite as pending."""
-    guid = (company_guid or "").strip() or company_name
+    """Write Cash Flow snapshot into local SQLite as pending (one row per FY)."""
+    company_guid = (company_guid or "").strip() or company_name
+    from_date = payload["from_date"]
+    from_iso = from_date.isoformat() if hasattr(from_date, "isoformat") else str(from_date)[:10]
     now = datetime.now(timezone.utc).isoformat()
     record = {
-        "guid": guid,
+        "guid": f"{company_guid}#{from_iso}",
         "company_name": company_name,
-        "company_guid": guid,
-        "from_date": payload["from_date"].isoformat(),
-        "to_date": payload["to_date"].isoformat(),
+        "company_guid": company_guid,
+        "from_date": from_iso,
+        "to_date": payload["to_date"].isoformat()
+        if hasattr(payload["to_date"], "isoformat")
+        else str(payload["to_date"])[:10],
         "months": json.dumps(payload.get("months") or [], ensure_ascii=False),
         "total_inflow": payload.get("total_inflow"),
         "total_outflow": payload.get("total_outflow"),
@@ -177,32 +184,68 @@ def sync_cash_flow(
     company_guid: str = "",
     books_from_iso: str = "",
 ) -> dict[str, Any]:
-    """Fetch books_from→FY-end (or today) Cash Flow → local DB → Supabase."""
-    payload = fetch_cash_flow(company_name, books_from_iso=books_from_iso)
-    staged = stage_cash_flow_local(company_name, company_guid, payload)
-    if staged < 1:
-        raise RuntimeError("Failed to stage tally_cash_flow to local DB")
+    """Fetch Cash Flow per FY (capped per run) → local DB → Supabase."""
+    from .date_utils import iter_company_fy_windows
+    from .financial_reports import _select_fy_windows_for_sync
+
+    all_windows = list(
+        iter_company_fy_windows(date.today(), books_from_iso, company_name)
+    )
+    windows = _select_fy_windows_for_sync(all_windows, company_name, force=False)
+    staged_total = 0
+    last_payload = None
+    errors: list[str] = []
+    for i, (fy_from, fy_to) in enumerate(windows):
+        if i > 0:
+            time.sleep(1.0)
+        try:
+            payload = fetch_cash_flow(
+                company_name,
+                from_date=fy_from,
+                to_date=fy_to,
+                books_from_iso=books_from_iso,
+            )
+            staged_total += stage_cash_flow_local(company_name, company_guid, payload)
+            last_payload = payload
+        except Exception as e:
+            errors.append(f"{fy_from}→{fy_to}: {e}")
+            logger.error(
+                f"Cash Flow failed for {company_name} [{fy_from}→{fy_to}]: {e}"
+            )
+
+    if staged_total < 1:
+        raise RuntimeError(
+            "Failed to stage tally_cash_flow to local DB"
+            + (f" ({'; '.join(errors)})" if errors else "")
+        )
 
     pushed, push_err = push_cash_flow_to_supabase(company_name)
+    payload = last_payload or {}
     logger.info(
-        f"Cash Flow synced for {company_name}: "
-        f"{len(payload.get('months') or [])} months "
-        f"({payload['from_date']} → {payload['to_date']}); "
-        f"nett={payload.get('total_nett')}; "
-        f"local=1 cloud={pushed}"
+        f"Cash Flow synced for {company_name}: years={len(windows)} "
+        f"staged={staged_total} "
+        f"last=({payload.get('from_date')} → {payload.get('to_date')}); "
+        f"cloud={pushed}"
         + (f" push_err={push_err}" if push_err else "")
     )
     result = {
-        "status": "ok" if not push_err else "partial",
+        "status": "ok" if not push_err and not errors else "partial",
+        "years": len(windows),
         "month_count": len(payload.get("months") or []),
         "total_inflow": payload.get("total_inflow"),
         "total_outflow": payload.get("total_outflow"),
         "total_nett": payload.get("total_nett"),
-        "from_date": payload["from_date"].isoformat(),
-        "to_date": payload["to_date"].isoformat(),
+        "from_date": payload["from_date"].isoformat()
+        if hasattr(payload.get("from_date"), "isoformat")
+        else str(payload.get("from_date")),
+        "to_date": payload["to_date"].isoformat()
+        if hasattr(payload.get("to_date"), "isoformat")
+        else str(payload.get("to_date")),
         "staged_local": True,
         "pushed": pushed or 0,
     }
     if push_err:
         result["push_error"] = push_err
+    if errors:
+        result["errors"] = errors
     return result

@@ -1,8 +1,41 @@
 import os
 import logging
+import re
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
+
+# Named year companies (e.g. "GlobeMate (2024-2025)", "Foo 2026-27") keep that FY.
+_YEAR_COMPANY_NAME_RE = re.compile(
+    r"(?:"
+    r"20\d{2}\s*[-–/]\s*20\d{2}"  # 2024-2025 / 2024/2025
+    r"|20\d{2}\s*[-–/]\s*\d{2}\b"  # 2026-27
+    r"|\(\s*20\d{2}\s*[-–/]\s*20\d{2}\s*\)"
+    r"|\(\s*20\d{2}\s*[-–/]\s*\d{2}\s*\)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Hard cap so BS/P&L/cash/ratio never ask Tally for a multi-year dump (freeze risk).
+_MAX_REPORT_SPAN_DAYS = 400
+
+
+def looks_like_year_company_name(company_name: str | None) -> bool:
+    """True when the company name encodes a specific FY (year-isolation files)."""
+    return bool(_YEAR_COMPANY_NAME_RE.search(company_name or ""))
+
+
+def current_indian_fy_start(as_on=None):
+    """1 April of the Indian FY that contains ``as_on``."""
+    from datetime import date as date_cls
+
+    if as_on is None:
+        as_on = date_cls.today()
+    elif isinstance(as_on, datetime):
+        as_on = as_on.date()
+    if as_on.month >= 4:
+        return date_cls(as_on.year, 4, 1)
+    return date_cls(as_on.year - 1, 4, 1)
 
 def get_monthly_date_ranges(books_from_iso=None):
     """
@@ -142,14 +175,22 @@ def indian_fy_end_for(start):
     return date_cls(start.year, 3, 31)
 
 
-def company_period_bounds(as_on=None, books_from_iso=None):
+def company_period_bounds(as_on=None, books_from_iso=None, company_name=None):
     """
-    Report window for this company: period start → min(today, that FY end).
+    Report window for BS / P&L / cash / ratio — always at most one Indian FY
+    so a single Tally export cannot span a decade and freeze the client.
 
-    Does not use the company name. Examples:
-      books_from 2024-04-01, today 2026-11-03 → 2024-04-01 … 2025-03-31
-      books_from 2026-04-01, today 2026-11-03 → 2026-04-01 … 2026-11-03
-      books_from missing, today 2026-11-03 → 2026-04-01 … 2026-11-03
+    Rules:
+      - books_from inside current FY → books_from … as_on
+      - Named year company (name has 2024-25 etc.) whose FY already ended
+        → that FY only (books_from … FY end), even if as_on is later
+      - Continuous company (old books_from, no year in name) → current FY … as_on
+        (fixes empty 2016-17 snapshots while vouchers still cover all years)
+
+    Examples (as_on = 2026-11-09):
+      books_from 2026-04-01 → 2026-04-01 … 2026-11-09
+      books_from 2024-04-01, name "X (2024-2025)" → 2024-04-01 … 2025-03-31
+      books_from 2016-04-01, name "SAMAGRA …" → 2026-04-01 … 2026-11-09
     """
     from datetime import date as date_cls
 
@@ -158,11 +199,77 @@ def company_period_bounds(as_on=None, books_from_iso=None):
     elif isinstance(as_on, datetime):
         as_on = as_on.date()
 
-    start = company_period_start(as_on, books_from_iso)
-    end = min(as_on, indian_fy_end_for(start))
+    books_start = company_period_start(as_on, books_from_iso)
+    books_fy_end = indian_fy_end_for(books_start)
+
+    if books_fy_end >= as_on:
+        # Live FY for this company file (e.g. 2026-27 year company, or new books).
+        start, end = books_start, as_on
+    elif looks_like_year_company_name(company_name):
+        # Closed / named year file opened later — keep that FY only.
+        start, end = books_start, books_fy_end
+    else:
+        # Continuous multi-year company: current FY only (anti-freeze).
+        start = current_indian_fy_start(as_on)
+        if books_start > start:
+            start = books_start
+        end = as_on
+
     if end < start:
         end = start
+
+    # Absolute safety: never hand Tally a multi-year report window.
+    if (end - start).days > _MAX_REPORT_SPAN_DAYS:
+        logging.warning(
+            "Report window %s→%s exceeds %s days; clamping to current FY for %s",
+            start,
+            end,
+            _MAX_REPORT_SPAN_DAYS,
+            company_name or books_from_iso or "company",
+        )
+        start = current_indian_fy_start(as_on)
+        if books_start > start:
+            start = books_start
+        end = as_on
+        if end < start:
+            end = start
+
     return start, end
+
+
+def iter_company_fy_windows(as_on=None, books_from_iso=None, company_name=None):
+    """
+    Yield (fy_start, fy_end_or_as_on) for every Indian FY covered by this company.
+
+    Named year companies → only that one FY (same as company_period_bounds).
+    Continuous companies → each FY from books_from through the FY containing as_on.
+    Each window is ≤ one FY (anti-freeze for Tally exports).
+    """
+    from datetime import date as date_cls
+
+    if as_on is None:
+        as_on = date_cls.today()
+    elif isinstance(as_on, datetime):
+        as_on = as_on.date()
+
+    if looks_like_year_company_name(company_name):
+        start, end = company_period_bounds(as_on, books_from_iso, company_name)
+        yield start, end
+        return
+
+    books_start = company_period_start(as_on, books_from_iso)
+    fy = date_cls(
+        books_start.year if books_start.month >= 4 else books_start.year - 1,
+        4,
+        1,
+    )
+    current_start = current_indian_fy_start(as_on)
+    while fy <= current_start:
+        fy_end = indian_fy_end_for(fy)
+        end = min(as_on, fy_end)
+        if end >= fy:
+            yield fy, end
+        fy = date_cls(fy.year + 1, 4, 1)
 
 
 def get_company_voucher_date_ranges(books_from_iso=None):
